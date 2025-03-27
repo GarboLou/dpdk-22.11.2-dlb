@@ -54,7 +54,15 @@
 #define EVT_PER_PORT_POOL	 ("per_port_pool")
 #define EVT_TX_FIRST		 ("tx_first")
 #define EVT_TX_PKT_SZ		 ("tx_pkt_sz")
+#define EVT_USE_DLB		     ("use_dlb")
 #define EVT_HELP                 ("help")
+
+// ==== customized options
+#define EVT_CALL_MAIN		("call_main")
+#define EVT_NB_RX_ADAPTERS	("nb_rx_adapters")
+#define EVT_NB_TX_ADAPTERS  ("nb_tx_adapters")
+#define EVT_E2E_LATENCY     ("e2e_latency")
+#define EVT_DUMMY_DELAY     ("dummy_delay")
 
 void evt_options_default(struct evt_options *opt);
 int evt_options_parse(struct evt_options *opt, int argc, char **argv);

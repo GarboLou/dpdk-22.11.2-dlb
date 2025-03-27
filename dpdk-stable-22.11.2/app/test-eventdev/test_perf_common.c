@@ -91,6 +91,175 @@ modex_test_data modex_test_case = {
 	.result_len = 128,
 };
 
+
+#define MAX_PORTS_QUEUES 256
+/** Number of elements in the array. */
+#define	RTE_DIM(a)	(sizeof (a) / sizeof ((a)[0]))
+static const char * const dev_xstat_strs[] = {
+	"dev_inflight_events",
+	"dev_nb_events_limit",
+	"dev_ldb_pool_size",
+	"dev_dir_pool_size",
+	"dev_pool_size",
+};
+
+enum dlb_dev_xstats {
+	DEV_INFL_EVENTS,
+	DEV_NB_EVENTS_LIMIT,
+	DEV_LDB_POOL_SIZE,
+	DEV_DIR_POOL_SIZE,
+	DEV_POOL_SIZE,
+};
+
+static const char * const port_xstat_strs[] = {
+	"tx_ok",
+	"tx_new",
+	"tx_fwd",
+	"tx_rel",
+	"tx_sched_ordered",
+	"tx_sched_unordered",
+	"tx_sched_atomic",
+	"tx_sched_directed",
+	"tx_invalid",
+	"tx_nospc_ldb_hw_credits",
+	"tx_nospc_dir_hw_credits",
+	"tx_nospc_hw_credits",
+	"tx_nospc_inflight_max",
+	"tx_nospc_new_event_limit",
+	"tx_nospc_inflight_credits",
+	"outstanding_releases",
+	"max_outstanding_releases",
+	"total_polls",
+	"zero_polls",
+	"rx_ok",
+	"rx_sched_ordered",
+	"rx_sched_unordered",
+	"rx_sched_atomic",
+	"rx_sched_directed",
+	"rx_sched_invalid",
+	"is_configured",
+	"is_load_balanced",
+};
+
+enum dlb_port_xstats {
+	TX_OK,
+	TX_NEW,
+	TX_FWD,
+	TX_REL,
+	TX_SCHED_ORDERED,
+	TX_SCHED_UNORDERED,
+	TX_SCHED_ATOMIC,
+	TX_SCHED_DIRECTED,
+	TX_SCHED_INVALID,
+	TX_NOSPC_LDB_HW_CREDITS,
+	TX_NOSPC_DIR_HW_CREDITS,
+	TX_NOSPC_HW_CREDITS,
+	TX_NOSPC_INFL_MAX,
+	TX_NOSPC_NEW_EVENT_LIM,
+	TX_NOSPC_INFL_CREDITS,
+	OUTSTANDING_RELEASES,
+	MAX_OUTSTANDING_RELEASES,
+	TOTAL_POLLS,
+	ZERO_POLLS,
+	RX_OK,
+	RX_SCHED_ORDERED,
+	RX_SCHED_UNORDERED,
+	RX_SCHED_ATOMIC,
+	RX_SCHED_DIRECTED,
+	RX_SCHED_INVALID,
+	IS_CONFIGURED,
+	PORT_IS_LOAD_BALANCED,
+};
+
+static const char * const queue_xstat_strs[] = {
+	"current_depth",
+	"is_load_balanced",
+};
+
+enum dlb_queue_xstats {
+	CURRENT_DEPTH,
+	QUEUE_IS_LOAD_BALANCED,
+};
+
+static void
+get_xstats_ids(uint8_t dev_id,
+	       enum rte_event_dev_xstats_mode mode,
+	       const char * const *names,
+	       uint64_t *ids,
+	       unsigned int len,
+	       uint8_t queue_port_id)
+{
+	struct rte_event_dev_xstats_name *xstats_names;
+	uint64_t *xstats_ids;
+	unsigned int size, i, j;
+	int ret;
+
+	/* Get amount of storage required */
+	ret = rte_event_dev_xstats_names_get(dev_id,
+					     mode,
+					     queue_port_id,
+					     NULL, /* names */
+					     NULL, /* ids */
+					     0);   /* num */
+	if (ret <= 0)
+		rte_panic("rte_event_dev_xstats_names_get err %d\n", ret);
+
+	size = (unsigned int)ret;
+
+	xstats_names = malloc(sizeof(struct rte_event_dev_xstats_name) * size);
+	xstats_ids = malloc(sizeof(uint64_t) * size);
+
+	if (!xstats_names || !xstats_ids)
+		rte_panic("unable to alloc memory for stats retrieval\n");
+
+	ret = rte_event_dev_xstats_names_get(dev_id, mode, queue_port_id,
+					     xstats_names, xstats_ids,
+					     size);
+	if (ret != (int)size)
+		rte_panic("rte_event_dev_xstats_names_get err %d\n", ret);
+
+	for (i = 0; i < len; i++) {
+		char name[RTE_EVENT_DEV_XSTATS_NAME_SIZE];
+
+		if (mode == RTE_EVENT_DEV_XSTATS_DEVICE)
+			rte_strlcpy(name,
+				    names[i],
+				    RTE_EVENT_DEV_XSTATS_NAME_SIZE - 1);
+		else if (mode == RTE_EVENT_DEV_XSTATS_PORT)
+			snprintf(name,
+				 RTE_EVENT_DEV_XSTATS_NAME_SIZE - 1,
+				 "port_%u_%s",
+				 queue_port_id,
+				 names[i]);
+		else
+			snprintf(name,
+				 RTE_EVENT_DEV_XSTATS_NAME_SIZE - 1,
+				 "qid_%u_%s",
+				 queue_port_id,
+				 names[i]);
+
+		for (j = 0; j < size; j++) {
+			if (strncmp(name,
+				    xstats_names[j].name,
+				    RTE_EVENT_DEV_XSTATS_NAME_SIZE) == 0) {
+				ids[i] = xstats_ids[j];
+				break;
+			}
+		}
+
+		if (j == size)
+			rte_panic("Couldn't find xstat %s\n", name);
+	}
+
+	free(xstats_names);
+	free(xstats_ids);
+}
+
+struct MyParams {
+    struct prod_data * producer;
+    struct worker_data * worker;
+};
+
 int
 perf_test_result(struct evt_test *test, struct evt_options *opt)
 {
@@ -148,6 +317,7 @@ perf_producer(void *arg)
 			ev.flow_id = flow_counter++ % nb_flows;
 			ev.event_ptr = m[i];
 			m[i]->timestamp = rte_get_timer_cycles();
+            // printf("mbuf pointer is %lu\n", m[i]);
 			while (rte_event_enqueue_burst(dev_id,
 						       port, &ev, 1) != 1) {
 				if (t->done)
@@ -187,6 +357,8 @@ perf_producer_burst(void *arg)
 	if (dev_info.max_event_port_enqueue_depth < burst_size)
 		burst_size = dev_info.max_event_port_enqueue_depth;
 
+	printf("Max enqueue burst size is %d\n", dev_info.max_event_port_enqueue_depth);
+
 	if (opt->verbose_level > 1)
 		printf("%s(): lcore %d dev_id %d port=%d queue %d\n", __func__,
 				rte_lcore_id(), dev_id, port, p->queue_id);
@@ -200,6 +372,12 @@ perf_producer_burst(void *arg)
 		ev[i].sub_event_type = 0; /* stage 0 */
 	}
 
+	// ==== calculate enqueue rate
+	uint64_t hz = rte_get_timer_hz();
+    uint64_t prev_tsc, cur_tsc, diff_tsc;
+    prev_tsc = rte_get_timer_cycles();
+	// ==== calculate enqueue rate
+
 	while (count < nb_pkts && t->done == false) {
 		if (rte_mempool_get_bulk(pool, (void **)m, burst_size) < 0)
 			continue;
@@ -209,22 +387,220 @@ perf_producer_burst(void *arg)
 			ev[i].event_ptr = m[i];
 			m[i]->timestamp = timestamp;
 		}
-                enq = rte_event_enqueue_burst(dev_id, port, ev, burst_size);
-                while (enq < burst_size) {
-                        enq += rte_event_enqueue_burst(dev_id, port,
-                                                        ev + enq,
-							burst_size - enq);
-                        if (t->done)
-                                break;
+        enq = rte_event_enqueue_burst(dev_id, port, ev, burst_size);
+        while (enq < burst_size) {
+            enq += rte_event_enqueue_burst(dev_id, port,
+                    ev + enq,
+                    burst_size - enq);
+            if (t->done)
+                    break;
 			rte_pause();
 			timestamp = rte_get_timer_cycles();
 			for (i = enq; i < burst_size; i++)
 				m[i]->timestamp = timestamp;
-                }
+        }
 		count += burst_size;
 	}
+
+	// ==== calculate enqueue rate
+	cur_tsc = rte_get_timer_cycles();
+	diff_tsc = cur_tsc - prev_tsc;
+	double pkt_rate  = (double) count / diff_tsc * hz / 1000000.0;
+	printf("\033[1;33m%s(): lcore %d dev_id %d port=%d queue %d, producer pkt_rate is %lf\033[0m\n", __func__,
+				rte_lcore_id(), dev_id, port, p->queue_id, pkt_rate);
+	// ==== calculate enqueue rate
+
 	return 0;
 }
+
+
+// static inline int
+// perf_lat_producer_worker_burst(void * arg)
+// {
+// 	uint32_t i;
+
+//     // initialization for producer
+//     struct MyParams * arg_ptr = arg;
+// 	uint64_t timestamp;
+// 	struct rte_event_dev_info dev_info;
+// 	struct prod_data *p  = arg_ptr->producer;
+// 	const uint8_t enq_port = p->port_id;
+
+// 	struct test_perf *t = p->t;
+// 	struct evt_options *opt = t->opt;
+// 	const uint8_t dev_id = p->dev_id;
+// 	struct rte_mempool *pool = t->pool;
+// 	const uint64_t nb_pkts = t->nb_pkts;
+// 	const uint32_t nb_flows = t->nb_flows;
+
+// 	uint32_t flow_counter = 0;
+// 	uint16_t enq = 0;
+// 	uint64_t count = 0;
+// 	struct perf_elt *m[MAX_PROD_ENQ_BURST_SIZE + 1] = {NULL};
+// 	struct rte_event enq_ev[MAX_PROD_ENQ_BURST_SIZE + 1];
+// 	uint32_t burst_size = opt->prod_enq_burst_sz;
+
+// 	rte_event_dev_info_get(dev_id, &dev_info);
+// 	if (dev_info.max_event_port_enqueue_depth < burst_size)
+// 		burst_size = dev_info.max_event_port_enqueue_depth;
+
+// 	// printf("Max enqueue burst size is %d\n", dev_info.max_event_port_enqueue_depth);
+
+// 	if (opt->verbose_level > 1)
+// 		printf("%s(): lcore %d dev_id %d enq_port=%d queue %d\n", __func__,
+// 				rte_lcore_id(), dev_id, enq_port, p->queue_id);
+
+// 	for (i = 0; i < burst_size; i++) {
+// 		enq_ev[i].op = RTE_EVENT_OP_NEW;
+// 		enq_ev[i].queue_id = p->queue_id;
+// 		enq_ev[i].sched_type = t->opt->sched_type_list[0];
+// 		enq_ev[i].priority = RTE_EVENT_DEV_PRIORITY_NORMAL;
+// 		enq_ev[i].event_type =  RTE_EVENT_TYPE_CPU;
+// 		enq_ev[i].sub_event_type = 0; /* stage 0 */
+// 	}
+
+//     // ==== calculate enqueue rate
+// 	uint64_t hz = rte_get_timer_hz();
+//     uint64_t prev_tsc, cur_tsc, diff_tsc;
+//     prev_tsc = rte_get_timer_cycles();
+// 	// ==== calculate enqueue rate
+    
+    
+//     // initialization for worker
+//     struct rte_event deq_ev[BURST_SIZE + 1];
+// 	uint8_t stage;
+
+//     struct worker_data *w  = arg_ptr->worker;
+// 	const uint8_t dev = w->dev_id;
+// 	const uint8_t deq_port = w->port_id;
+// 	const uint8_t prod_timer_type = opt->prod_type == EVT_PROD_TYPE_EVENT_TIMER_ADPTR;
+// 	const uint8_t prod_crypto_type = opt->prod_type == EVT_PROD_TYPE_EVENT_CRYPTO_ADPTR;
+// 	uint8_t *const sched_type_list = &t->sched_type_list[0];
+// 	const uint8_t nb_stages = t->opt->nb_stages;
+// 	const uint8_t laststage = nb_stages - 1;
+// 	uint8_t cnt = 0;
+// 	void *bufs[16] __rte_cache_aligned;
+// 	int const sz = RTE_DIM(bufs);
+// 	if (opt->verbose_level > 1)
+// 		printf("%s(): lcore %d dev_id %d deq_port=%d\n", __func__, rte_lcore_id(), dev, deq_port);
+
+//     /* Time */
+//     // MODIFY HERE: TEST LATENCY PERIOD
+//     uint16_t interval = 1;  // unit of s
+//     uint64_t interval_cycles = (uint64_t) (interval * hz / 1000.0);
+//     uint64_t rx_cur_tsc;
+// 	uint16_t nb_rx = 0;
+//     uint16_t nb_tx = 0;
+//     uint64_t c2c_lat;
+//     struct perf_elt * ev_ptr_temp;
+//     evt_log("Tx queue is %d. nb_stages is %d, last stage is %d.", rte_lcore_id()%evt_nr_active_lcores(opt->wlcores), nb_stages, laststage);
+
+
+//     // start main program
+// 	while (count < nb_pkts && t->done == false) {
+//         // enqueue events
+// 		if (rte_mempool_get_bulk(pool, (void **)m, burst_size) >= 0) {
+//             timestamp = rte_get_timer_cycles();
+//             for (i = 0; i < burst_size; i++) {
+//                 enq_ev[i].flow_id = flow_counter++ % nb_flows;
+//                 enq_ev[i].event_ptr = m[i];
+//                 m[i]->timestamp = timestamp;
+//             }
+//             enq = rte_event_enqueue_burst(dev_id, enq_port, enq_ev, burst_size);
+//             while (enq < burst_size) {
+//                 enq += rte_event_enqueue_burst(dev_id, enq_port,
+//                         enq_ev + enq,
+//                         burst_size - enq);
+//                 if (t->done)
+//                         break;
+//                 rte_pause();
+//                 timestamp = rte_get_timer_cycles();
+//                 for (i = enq; i < burst_size; i++)
+//                     m[i]->timestamp = timestamp;
+//             }
+//             count += burst_size;
+//         }
+
+//         rte_pause();
+
+//         // dequeue events
+//         nb_rx = rte_event_dequeue_burst(dev, deq_port, deq_ev, BURST_SIZE, 0);
+//         if (!nb_rx) {
+//             rte_pause();
+// 			continue;
+// 		} else {
+//             rx_cur_tsc = rte_get_timer_cycles();
+//             for (i = 0; i < nb_rx; i++) {
+//                 stage = deq_ev[i].queue_id % nb_stages;
+
+//                 // latency stats
+//                 ev_ptr_temp = deq_ev[i].event_ptr;
+//                 c2c_lat = rx_cur_tsc - ev_ptr_temp->timestamp;
+//                 c2c_latency_array[(int)rte_lcore_id()][(int)deq_ev[i].queue_id] += c2c_lat;
+                
+
+//                 /* last stage in pipeline */
+//                 if (unlikely(stage == laststage)) {
+//                     cnt = perf_process_last_stage(pool, prod_crypto_type, &deq_ev[i], w, bufs, sz, cnt);
+//                     deq_ev[i].op = RTE_EVENT_OP_RELEASE;
+//                 } else {
+//                     // fwd_event(&ev[i], sched_type_list, nb_stages);
+//                 }
+
+//                 // STATS TRACKING
+//                 wlcore_queue_pkts[(int)rte_lcore_id()][(int)deq_ev[i].queue_id] += 1;
+//                 // printf("%ld, wlcore %d processed packets from queue %d\n", wlcore_queue_pkts[dev][ev[i].queue_id], dev, ev[i].queue_id);
+//             }
+//         }
+
+// 	}
+
+// 	// ==== calculate enqueue rate
+// 	cur_tsc = rte_get_timer_cycles();
+// 	diff_tsc = cur_tsc - prev_tsc;
+// 	double pkt_rate  = (double) count / diff_tsc * hz / 1000000.0;
+// 	printf("\033[1;33m%s(): lcore %d dev_id %d enq_port=%d queue %d, producer pkt_rate is %lf\033[0m\n", __func__,
+// 				rte_lcore_id(), dev_id, enq_port, p->queue_id, pkt_rate);
+// 	// ==== calculate enqueue rate
+
+
+//     // // =========== PRINT WORKER STATS
+// 	int stats_nb_queues = 0;
+// 	uint8_t nb_prod = opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR ?
+// 		opt->nb_rx_adapters : evt_nr_active_lcores(opt->plcores);
+// 	if (opt->nb_dir_queues)
+// 		stats_nb_queues = nb_prod * (opt->nb_stages + 1);
+// 	else
+// 		stats_nb_queues = nb_prod * opt->nb_stages;
+
+//     // ==== calculate dequeue rate
+// 	cur_tsc = rte_get_timer_cycles();
+// 	diff_tsc = cur_tsc - prev_tsc;
+//     count = 0;
+//     uint64_t total_lat = 0;
+//     for (uint8_t i = 0; i < stats_nb_queues; i++) {
+//         count += wlcore_queue_pkts[rte_lcore_id()][i];
+//         total_lat += c2c_latency_array[rte_lcore_id()][i];
+// 	}
+//     pkt_rate  = (double) count / diff_tsc * hz / 1000000.0;
+// 	printf("\033[1;36mwlcore %d dequeue pkt_rate is %lf\033[0m\n", rte_lcore_id(), pkt_rate);
+	
+//     // ==== calculate core to core latency
+//     double avg_lat = (double) total_lat / hz * 1000000.0 / count;
+// 	printf("\033[1;36mwlcore %d: total latency is %lu, average core to core latency is %lf\033[0m\n", rte_lcore_id(), total_lat, avg_lat);
+
+// 	// printf("====== Worker %d ======\n", rte_lcore_id());
+// 	// for (uint8_t i = 0; i < stats_nb_queues; i++) {
+// 	// 	printf("\033[1;36mwlcore %d processed %ld packets (%lf %%) from queue %d\033[0m\n", rte_lcore_id(), wlcore_queue_pkts[rte_lcore_id()][i], wlcore_queue_pkts[rte_lcore_id()][i]*1.0/count*100.0, i);
+// 	// }
+// 	// =========== PRINT WORKER STATS
+
+// 	perf_worker_cleanup(pool, dev, deq_port, deq_ev, 0, nb_rx);
+
+
+// 	return 0;
+// }
+
 
 static inline int
 perf_event_timer_producer(void *arg)
@@ -594,8 +970,10 @@ processed_pkts(struct test_perf *t)
 	uint8_t i;
 	uint64_t total = 0;
 
-	for (i = 0; i < t->nb_workers; i++)
+	for (i = 0; i < t->nb_workers; i++) {
 		total += t->worker[i].processed_pkts;
+        // printf("processed pkts at core %d is %lu\n", i, t->worker[i].processed_pkts);
+    }
 
 	return total;
 }
@@ -635,17 +1013,29 @@ perf_launch_lcores(struct evt_test *test, struct evt_options *opt,
 		port_idx++;
 	}
 
+    // port_idx++;
 	/* launch producers */
+	if (opt->call_main == 1) {
+		rte_eal_mp_remote_launch(perf_producer_wrapper, &t->prod[port_idx], CALL_MAIN);
+	}
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		if (!(opt->plcores[lcore_id]))
 			continue;
 
+        // struct MyParams lat_param = {
+        //     .producer = &t->prod[port_idx],
+        //     .worker = &t->worker[port_idx-1],
+        // };
+
+        // ret = rte_eal_remote_launch(perf_lat_producer_worker_burst,
+		// 		&lat_param, lcore_id);
 		ret = rte_eal_remote_launch(perf_producer_wrapper,
 				&t->prod[port_idx], lcore_id);
 		if (ret) {
 			evt_err("failed to launch perf_producer %d", lcore_id);
 			return ret;
 		}
+        printf("producer core %d with port id %d.\n", lcore_id, port_idx);
 		port_idx++;
 	}
 
@@ -664,13 +1054,255 @@ perf_launch_lcores(struct evt_test *test, struct evt_options *opt,
 
 	const uint64_t freq_mhz = rte_get_timer_hz() / 1000000;
 	int64_t remaining = t->outstand_pkts - processed_pkts(t);
+    
+	uint64_t test_perf_cycles = rte_get_timer_cycles();
+
+
+    int i, j;
+    uint64_t port_xstat_ids[MAX_PORTS_QUEUES][RTE_DIM(port_xstat_strs)];
+    uint64_t port_xstat_vals[MAX_PORTS_QUEUES][RTE_DIM(port_xstat_strs)];
+    uint64_t prev_port_xstat_vals[MAX_PORTS_QUEUES][RTE_DIM(port_xstat_strs)] = {0};
+
+    uint64_t queue_xstat_ids[MAX_PORTS_QUEUES][RTE_DIM(queue_xstat_strs)];
+    uint64_t queue_xstat_vals[MAX_PORTS_QUEUES][RTE_DIM(queue_xstat_strs)] = {0};
+    uint64_t prev_queue_xstat_vals[MAX_PORTS_QUEUES][RTE_DIM(queue_xstat_strs)] = {0};
+
+    uint64_t dev_xstat_ids[RTE_DIM(dev_xstat_strs)];
+    uint64_t dev_xstat_vals[RTE_DIM(dev_xstat_strs)];
+
+    if (opt->use_dlb) {
+        ret = rte_event_dev_xstats_get(opt->dev_id,
+                        RTE_EVENT_DEV_XSTATS_DEVICE,
+                        0,
+                        &dev_xstat_ids[DEV_LDB_POOL_SIZE],
+                        &dev_xstat_vals[DEV_LDB_POOL_SIZE],
+                        1);
+        if (ret != 1)
+            rte_panic("Failed to get ldb pool size\n");
+
+        ret = rte_event_dev_xstats_get(opt->dev_id,
+                        RTE_EVENT_DEV_XSTATS_DEVICE,
+                        0,
+                        &dev_xstat_ids[DEV_DIR_POOL_SIZE],
+                        &dev_xstat_vals[DEV_DIR_POOL_SIZE],
+                        1);
+
+        if (ret != 1)
+            rte_panic("Failed to get dir pool size\n");
+
+        ret = rte_event_dev_xstats_get(opt->dev_id,
+                        RTE_EVENT_DEV_XSTATS_DEVICE,
+                        0,
+                        &dev_xstat_ids[DEV_POOL_SIZE],
+                        &dev_xstat_vals[DEV_POOL_SIZE],
+                        1);
+        if (ret != 1)
+            rte_panic("Failed to get pool size\n");
+    }
+
+
+    uint64_t total_polls, zero_polls;
+    float zero_poll_pct;
+	float zero_poll_pct_prev = 100.0;
+    int num_ports = perf_nb_event_ports(opt);
+
+    struct rte_event_dev_info dev_info;
+	ret = rte_event_dev_info_get(opt->dev_id, &dev_info);
+	if (ret) {
+		evt_err("failed to get eventdev info %d", opt->dev_id);
+		return ret;
+	}
+
+    if (opt->use_dlb) {
+        for (i = 0; i < num_ports; i++) {
+            get_xstats_ids(opt->dev_id,
+                    RTE_EVENT_DEV_XSTATS_PORT,
+                    port_xstat_strs,
+                    port_xstat_ids[i],
+                    RTE_DIM(port_xstat_strs),
+                    i);
+        }
+
+        for (i = 0; i < 1; i++) {
+            get_xstats_ids(opt->dev_id,
+                    RTE_EVENT_DEV_XSTATS_QUEUE,
+                    queue_xstat_strs,
+                    queue_xstat_ids[i],
+                    RTE_DIM(queue_xstat_strs),
+                    i);
+        }
+    }
+
+    int max_wlcores = evt_nr_active_lcores(opt->wlcores);
+    int nb_wlcores = evt_nr_active_lcores(opt->wlcores);
+    int flag = 0;
+    int is_ldb;
+	uint64_t depth, max_depth;
+    int dynamic_allocation = 0;
 
 	while (t->done == false) {
 		const uint64_t new_cycles = rte_get_timer_cycles();
 
 		if ((new_cycles - perf_cycles) > perf_sample) {
+            printf("\n");
 			const uint64_t latency = total_latency(t);
 			const uint64_t pkts = processed_pkts(t);
+
+            if (dynamic_allocation == 1 && opt->use_dlb) {
+                // ==============================
+                /* Initialize prev_sched_throughput[i] */
+                ret = rte_event_dev_xstats_get(opt->dev_id,
+                        RTE_EVENT_DEV_XSTATS_DEVICE,
+                        0,
+                        dev_xstat_ids,
+                        dev_xstat_vals,
+                        RTE_DIM(dev_xstat_strs));
+                if (ret != RTE_DIM(dev_xstat_strs))
+                    rte_panic("Failed to get device xstats\n");
+                max_depth = dev_xstat_vals[DEV_LDB_POOL_SIZE];
+
+                total_polls = 0;
+                zero_polls = 0;
+                nb_wlcores = evt_nr_active_lcores(opt->wlcores);
+                for (i = 0; i < nb_wlcores; i++) {
+                    ret = rte_event_dev_xstats_get(opt->dev_id,
+                                    RTE_EVENT_DEV_XSTATS_PORT,
+                                    i,
+                                    port_xstat_ids[i],
+                                    port_xstat_vals[i],
+                                    RTE_DIM(port_xstat_strs));
+                    if (ret != RTE_DIM(port_xstat_strs))
+                        rte_panic("Failed to get port %u's xstats (ret: %d)\n", i, ret);
+                    total_polls += port_xstat_vals[i][TOTAL_POLLS] - prev_port_xstat_vals[i][TOTAL_POLLS];
+                    zero_polls += port_xstat_vals[i][ZERO_POLLS] - prev_port_xstat_vals[i][ZERO_POLLS];
+                    zero_poll_pct = ((port_xstat_vals[i][ZERO_POLLS] - prev_port_xstat_vals[i][ZERO_POLLS]) * 100.0f) / (port_xstat_vals[i][TOTAL_POLLS] - prev_port_xstat_vals[i][TOTAL_POLLS]);
+                    evt_log("port [%u] zero poll percent %f.", i, zero_poll_pct);
+                    evt_log("rx ok is: %lu", port_xstat_vals[i][RX_OK]-prev_port_xstat_vals[i][RX_OK]);
+                    prev_port_xstat_vals[i][TOTAL_POLLS] = port_xstat_vals[i][TOTAL_POLLS];
+                    prev_port_xstat_vals[i][ZERO_POLLS] = port_xstat_vals[i][ZERO_POLLS];
+                    prev_port_xstat_vals[i][RX_OK] = port_xstat_vals[i][RX_OK];
+                }
+                zero_poll_pct = (zero_polls * 100.0f) / total_polls;
+                evt_log("%d workers' overall zero poll percent %f.", nb_wlcores, zero_poll_pct);
+
+                // for (i = 0; i < 1; i++) {
+                //     ret = rte_event_dev_xstats_get(opt->dev_id,
+                //                     RTE_EVENT_DEV_XSTATS_QUEUE,
+                //                     i,
+                //                     queue_xstat_ids[i],
+                //                     queue_xstat_vals[i],
+                //                     RTE_DIM(queue_xstat_strs));
+                //     if (ret != RTE_DIM(queue_xstat_strs))
+                //         rte_panic("Failed to get queue %u's xstats\n", i);
+                // }
+                // is_ldb = queue_xstat_vals[0][QUEUE_IS_LOAD_BALANCED];
+                // depth = queue_xstat_vals[0][CURRENT_DEPTH];
+                // evt_log("Queue 0's max depth is %" PRIu64 ", current depth is %" PRIu64 ", in flight is %" PRIu64 ".", max_depth, depth, dev_xstat_vals[DEV_INFL_EVENTS]);
+                // if (max_depth == 0) {  /* DLB 2.5 uses combined credit pool */
+                //     max_depth = dev_xstat_vals[DEV_POOL_SIZE];
+                //     depth = queue_xstat_vals[0][CURRENT_DEPTH];
+                // } 
+                // if (max_depth != 0) {
+                //     evt_log("Queue 0's max depth is %lu, current depth is %lu.", max_depth, depth);
+                // }
+
+                if (zero_poll_pct > 90) {
+                    if (nb_wlcores > 1) {
+                        // close one worker core with largest port number
+                        ret = rte_event_port_unlink(opt->dev_id, nb_wlcores-1, NULL, 0);
+                        opt->wlcores[opt->wlcore_idx[nb_wlcores-1]] = 0;
+                        if (ret == 0) evt_err("failed to unlink port");
+                        evt_log("worker core %d with port %d is unlinked.", opt->wlcore_idx[nb_wlcores-1], nb_wlcores-1);
+                        for (j = 0; j < RTE_DIM(port_xstat_strs); j++) {
+                            port_xstat_ids[nb_wlcores-1][j] = 0;
+                        }
+                    }
+                } 
+                else if (30 < zero_poll_pct && zero_poll_pct < 60) {
+                    if (nb_wlcores < max_wlcores) {
+                        // increase worker core count
+                        opt->wlcores[opt->wlcore_idx[nb_wlcores]] = 1;
+                        ret = rte_event_port_link(opt->dev_id, nb_wlcores, NULL, NULL, 0);
+                        if (ret == 0) evt_err("failed to link port");
+                        evt_log("worker core %d with port %d is linked with %d queues.", opt->wlcore_idx[nb_wlcores], nb_wlcores, ret);
+                        ret = rte_eal_remote_launch(worker, &t->worker[nb_wlcores], opt->wlcore_idx[nb_wlcores]);
+                        if (ret) {
+                            evt_err("failed to launch worker %d", opt->wlcore_idx[nb_wlcores]);
+                            return ret;
+                        }
+                        get_xstats_ids(opt->dev_id,
+                            RTE_EVENT_DEV_XSTATS_PORT,
+                            port_xstat_strs,
+                            port_xstat_ids[nb_wlcores],
+                            RTE_DIM(port_xstat_strs),
+                            nb_wlcores);
+                        nb_wlcores = evt_nr_active_lcores(opt->wlcores);
+                    }
+                } 
+                else if (zero_poll_pct <= 30) {
+                    while (nb_wlcores < max_wlcores) {
+                        // increase worker core count
+                        opt->wlcores[opt->wlcore_idx[nb_wlcores]] = 1;
+                        ret = rte_event_port_link(opt->dev_id, nb_wlcores, NULL, NULL, 0);
+                        if (ret == 0) evt_err("failed to link port");
+                        evt_log("worker core %d with port %d is linked with %d queues.", opt->wlcore_idx[nb_wlcores], nb_wlcores, ret);
+                        ret = rte_eal_remote_launch(worker, &t->worker[nb_wlcores], opt->wlcore_idx[nb_wlcores]);
+                        if (ret) {
+                            evt_err("failed to launch worker %d", opt->wlcore_idx[nb_wlcores]);
+                            return ret;
+                        }
+                        get_xstats_ids(opt->dev_id,
+                            RTE_EVENT_DEV_XSTATS_PORT,
+                            port_xstat_strs,
+                            port_xstat_ids[nb_wlcores],
+                            RTE_DIM(port_xstat_strs),
+                            nb_wlcores);
+                        nb_wlcores = evt_nr_active_lcores(opt->wlcores);
+                    }
+                }
+
+                
+                // if ((new_cycles - test_perf_cycles) > 2*perf_sample) {
+                //     if (flag == 0) {
+                //         // close one worker core with largest port number
+                //         ret = rte_event_port_unlink(opt->dev_id, 1, NULL, 0);
+                //         opt->wlcores[opt->wlcore_idx[1]] = 0;
+                //         if (ret <= 0) evt_err("failed to unlink port");
+                //         evt_log("worker core %d with port %d is unlinked with %d queues.", opt->wlcore_idx[1], 0, ret);
+                //         flag = 1;
+                //         rte_mb();
+                //     }
+                //     else {
+                //         // increase worker core count
+                //         opt->wlcores[opt->wlcore_idx[1]] = 1;
+                //         ret = rte_event_port_link(opt->dev_id, 1, NULL, NULL, 0);
+                //         if (ret <= 0) evt_err("failed to link port");
+                //         evt_log("worker core %d with port %d is linked with %d queues.", opt->wlcore_idx[1], 0, ret);
+                //         // uint8_t queues_list[RTE_EVENT_MAX_QUEUES_PER_DEV];
+                //         // uint8_t priorities_list[RTE_EVENT_MAX_QUEUES_PER_DEV];
+                //         // ret = rte_event_port_links_get(opt->dev_id, 0, queues_list, priorities_list);
+                //         // evt_log("worker core %d with port %d is linked with %d queues %d %d %d %d.", opt->wlcore_idx[0], 0, ret, queues_list[0], queues_list[1], queues_list[2], queues_list[3]);
+                //         ret = rte_eal_remote_launch(worker, &t->worker[1], opt->wlcore_idx[1]);
+                //         if (ret) {
+                //             evt_err("failed to launch worker %d", opt->wlcore_idx[1]);
+                //             return ret;
+                //         }
+                //         flag = 0;
+                //         rte_mb();
+                //     }
+                //     // t->nb_workers = evt_nr_active_lcores(opt->wlcores);
+                //     // evt_log("t->nb_workers is %d", t->nb_workers);
+                //     test_perf_cycles = new_cycles;
+
+                //     // uint8_t queues[RTE_EVENT_MAX_QUEUES_PER_DEV];
+                //     // uint8_t priorities[RTE_EVENT_MAX_QUEUES_PER_DEV];
+                //     // evt_log("port 0 has %d links", rte_event_port_links_get(opt->dev_id, 0, queues, priorities));
+                //     // evt_log("port 1 has %d links", rte_event_port_links_get(opt->dev_id, 1, queues, priorities));
+                //     // evt_log("port 2 has %d links", rte_event_port_links_get(opt->dev_id, 2, queues, priorities));
+                // }
+
+                // ==============================
+            }
 
 			remaining = t->outstand_pkts - pkts;
 			float mpps = (float)(perf_remaining-remaining)/1000000;
@@ -680,12 +1312,12 @@ perf_launch_lcores(struct evt_test *test, struct evt_options *opt,
 			total_mpps += mpps;
 			++samples;
 			if (opt->fwd_latency && pkts > 0) {
-				printf(CLGRN"\r%.3f mpps avg %.3f mpps [avg fwd latency %.3f us] "CLNRM,
+				printf(CLGRN"\r%.3f mpps avg %.3f mpps [avg fwd latency %.3f us] \n"CLNRM,
 					mpps, total_mpps/samples,
 					(float)(latency/pkts)/freq_mhz);
 			} else {
-				printf(CLGRN"\r%.3f mpps avg %.3f mpps"CLNRM,
-					mpps, total_mpps/samples);
+				printf(CLGRN"\rsample %ld: %.3f mpps avg %.3f mpps \n"CLNRM,
+					samples, mpps, total_mpps/samples);
 			}
 			fflush(stdout);
 
@@ -718,9 +1350,13 @@ perf_launch_lcores(struct evt_test *test, struct evt_options *opt,
 		}
 	}
 	printf("\n");
+
+
 	return 0;
 }
 
+
+// setup rx adapter
 static int
 perf_event_rx_adapter_setup(struct evt_options *opt, uint8_t stride,
 		struct rte_event_port_conf prod_conf)
@@ -728,6 +1364,8 @@ perf_event_rx_adapter_setup(struct evt_options *opt, uint8_t stride,
 	int ret = 0;
 	uint16_t prod;
 	struct rte_event_eth_rx_adapter_queue_conf queue_conf;
+
+    // uint16_t eth_prod = 0;
 
 	memset(&queue_conf, 0,
 			sizeof(struct rte_event_eth_rx_adapter_queue_conf));
@@ -744,31 +1382,41 @@ perf_event_rx_adapter_setup(struct evt_options *opt, uint8_t stride,
 			return ret;
 		}
 		queue_conf.ev.queue_id = prod * stride;
-		ret = rte_event_eth_rx_adapter_create(prod, opt->dev_id,
-				&prod_conf);
-		if (ret) {
-			evt_err("failed to create rx adapter[%d]", prod);
-			return ret;
-		}
-		ret = rte_event_eth_rx_adapter_queue_add(prod, prod, -1,
-				&queue_conf);
-		if (ret) {
-			evt_err("failed to add rx queues to adapter[%d]", prod);
-			return ret;
-		}
 
-		if (!(cap & RTE_EVENT_ETH_RX_ADAPTER_CAP_INTERNAL_PORT)) {
-			uint32_t service_id;
+        /* TODO: Add more RX queues to adapter */
+        for (uint16_t q = 0; q < opt->nb_rx_adapters; q++) {
+            ret = rte_event_eth_rx_adapter_create(q, opt->dev_id,
+                    &prod_conf);
+            if (ret) {
+                evt_err("failed to create rx adapter[%d]", prod);
+                return ret;
+            }
 
-			rte_event_eth_rx_adapter_service_id_get(prod,
-					&service_id);
-			ret = evt_service_setup(service_id);
-			if (ret) {
-				evt_err("Failed to setup service core"
-						" for Rx adapter\n");
-				return ret;
-			}
-		}
+            queue_conf.ev.queue_id = q;
+            ret = rte_event_eth_rx_adapter_queue_add(q, prod, q,
+                    &queue_conf);
+            if (ret) {
+                evt_err("failed to add rx queues to adapter[%d]", prod);
+                return ret;
+            }
+
+            if (!(cap & RTE_EVENT_ETH_RX_ADAPTER_CAP_INTERNAL_PORT)) {
+                uint32_t service_id;
+
+                rte_event_eth_rx_adapter_service_id_get(q,
+                        &service_id);
+
+                printf("cap is %x, constant is %x.\n", cap, RTE_EVENT_ETH_RX_ADAPTER_CAP_INTERNAL_PORT);
+                evt_log("%s(): Setup service core... Service id is %d.", __func__, service_id);
+
+                ret = evt_service_setup(service_id);
+                if (ret) {
+                    evt_err("Failed to setup service core"
+                            " for Rx adapter\n");
+                    return ret;
+                }
+            }
+        }
 	}
 
 	return ret;
@@ -941,7 +1589,8 @@ perf_event_dev_port_setup(struct evt_test *test, struct evt_options *opt,
 		w->latency = 0;
 
 		struct rte_event_port_conf conf = *port_conf;
-		conf.event_port_cfg |= RTE_EVENT_PORT_CFG_HINT_WORKER;
+		// conf.event_port_cfg |= RTE_EVENT_PORT_CFG_HINT_WORKER;
+		conf.event_port_cfg |= RTE_EVENT_PORT_CFG_HINT_CONSUMER;
 
 		ret = rte_event_port_setup(opt->dev_id, port, &conf);
 		if (ret) {
@@ -961,12 +1610,13 @@ perf_event_dev_port_setup(struct evt_test *test, struct evt_options *opt,
 			ret = rte_event_port_link(opt->dev_id, port, NULL, NULL, 0);
 		}
 		if (ret != nb_queues - opt->nb_dir_queues) {
-			evt_err("failed to link all queues to port %d", port);
+			evt_err("linked %d queues, failed to link all queues to port %d", ret, port);
 			return -EINVAL;
 		}
 	}
 
 	/* port for producers, no links */
+    // ====== Use ethernet device as producer!!!!!
 	if (opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR) {
 		for ( ; port < perf_nb_event_ports(opt); port++) {
 			struct prod_data *p = &t->prod[port];
@@ -976,9 +1626,10 @@ perf_event_dev_port_setup(struct evt_test *test, struct evt_options *opt,
 		struct rte_event_port_conf conf = *port_conf;
 		conf.event_port_cfg |= RTE_EVENT_PORT_CFG_HINT_PRODUCER;
 
-		ret = perf_event_rx_adapter_setup(opt, stride, conf);
-		if (ret)
-			return ret;
+        /* TODO: Add more RX queues to adapter */
+        ret = perf_event_rx_adapter_setup(opt, stride, conf);
+        if (ret)
+            return ret;
 	} else if (opt->prod_type == EVT_PROD_TYPE_EVENT_TIMER_ADPTR) {
 		prod = 0;
 		for ( ; port < perf_nb_event_ports(opt); port++) {
@@ -1123,6 +1774,9 @@ perf_event_dev_port_setup(struct evt_test *test, struct evt_options *opt,
 					return -EINVAL;
 				}
 			}
+            // rte_event_port_link(opt->dev_id, port,
+			// 				NULL,
+			// 				NULL, 0);
 			prod++;
 		}
 	}
@@ -1251,7 +1905,7 @@ perf_worker_cleanup(struct rte_mempool *const pool, uint8_t dev_id,
 
 		for (i = 0; i < nb_deq; i++)
 			events[i].op = RTE_EVENT_OP_RELEASE;
-		rte_event_enqueue_burst(dev_id, port_id, events + nb_enq, nb_deq - nb_enq);
+		rte_event_enqueue_burst(dev_id, port_id, events, nb_deq);
 	}
 	rte_event_port_quiesce(dev_id, port_id, perf_event_port_flush, pool);
 }
@@ -1277,8 +1931,8 @@ perf_elt_init(struct rte_mempool *mp, void *arg __rte_unused,
 	memset(obj, 0, mp->elt_size);
 }
 
-#define NB_RX_DESC			128
-#define NB_TX_DESC			512
+#define NB_RX_DESC			1024
+#define NB_TX_DESC			1024
 int
 perf_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 {
@@ -1292,7 +1946,7 @@ perf_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 		.rx_adv_conf = {
 			.rss_conf = {
 				.rss_key = NULL,
-				.rss_hf = RTE_ETH_RSS_IP,
+				.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP,
 			},
 		},
 	};
@@ -1327,24 +1981,30 @@ perf_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 				local_port_conf.rx_adv_conf.rss_conf.rss_hf);
 		}
 
-		if (rte_eth_dev_configure(i, 1, 1, &local_port_conf) < 0) {
+        /* Modified nb_rx_queue based on number of Rx adapters, nb_tx_queues based on number of # wlcores */
+		if (rte_eth_dev_configure(i, opt->nb_rx_adapters, evt_nr_active_lcores(opt->wlcores), &local_port_conf) < 0) {
 			evt_err("Failed to configure eth port [%d]", i);
 			return -EINVAL;
 		}
 
-		if (rte_eth_rx_queue_setup(i, 0, NB_RX_DESC,
-				rte_socket_id(), NULL, t->pool) < 0) {
-			evt_err("Failed to setup eth port [%d] rx_queue: %d.",
-					i, 0);
-			return -EINVAL;
-		}
+        /* TODO: MODIFY TO ADD MULTIPLE QUEUES */
+        for (int32_t q = 0; q < opt->nb_rx_adapters; q++) {
+            if (rte_eth_rx_queue_setup(i, q, NB_RX_DESC,
+                    rte_socket_id(), NULL, t->pool) < 0) {
+                evt_err("Failed to setup eth port [%d] rx_queue: %d.",
+                        i, q);
+                return -EINVAL;
+            }
+        }
 
-		if (rte_eth_tx_queue_setup(i, 0, NB_TX_DESC,
-					rte_socket_id(), NULL) < 0) {
-			evt_err("Failed to setup eth port [%d] tx_queue: %d.",
-					i, 0);
-			return -EINVAL;
-		}
+        for (int32_t q = 0; q < evt_nr_active_lcores(opt->wlcores); q++) {
+            if (rte_eth_tx_queue_setup(i, q, NB_TX_DESC,
+                        rte_socket_id(), NULL) < 0) {
+                evt_err("Failed to setup eth port [%d] tx_queue: %d.",
+                        i, q);
+                return -EINVAL;
+            }
+        }
 
 		ret = rte_eth_promiscuous_enable(i);
 		if (ret != 0) {
@@ -1365,9 +2025,15 @@ perf_ethdev_rx_stop(struct evt_test *test, struct evt_options *opt)
 
 	if (opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR) {
 		RTE_ETH_FOREACH_DEV(i) {
-			rte_event_eth_rx_adapter_stop(i);
-			rte_event_eth_rx_adapter_queue_del(i, i, -1);
-			rte_eth_dev_rx_queue_stop(i, 0);
+            /* TODO */
+            for (uint16_t q = 0; q < opt->nb_rx_adapters; q++) {
+                rte_event_eth_rx_adapter_stop(q);
+                rte_event_eth_rx_adapter_queue_del(q, i, q);
+			    rte_eth_dev_rx_queue_stop(i, q);
+            }
+            // rte_event_eth_rx_adapter_stop(i);
+            // rte_event_eth_rx_adapter_queue_del(i, i, -1);
+			// rte_eth_dev_rx_queue_stop(i, 0);
 		}
 	}
 }
@@ -1380,9 +2046,15 @@ perf_ethdev_destroy(struct evt_test *test, struct evt_options *opt)
 
 	if (opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR) {
 		RTE_ETH_FOREACH_DEV(i) {
-			rte_event_eth_tx_adapter_stop(i);
-			rte_event_eth_tx_adapter_queue_del(i, i, -1);
-			rte_eth_dev_tx_queue_stop(i, 0);
+            rte_event_eth_tx_adapter_stop(i);
+            rte_event_eth_tx_adapter_queue_del(i, i, -1);
+            /* TODO */
+            for (uint16_t q = 0; q < evt_nr_active_lcores(opt->wlcores); q++) {
+                rte_eth_dev_tx_queue_stop(i, q);
+            }
+            // rte_event_eth_tx_adapter_stop(i);
+            // rte_event_eth_tx_adapter_queue_del(i, i, -1);
+			// rte_eth_dev_tx_queue_stop(i, 0);
 			rte_eth_dev_stop(i);
 		}
 	}
@@ -1549,6 +2221,7 @@ perf_mempool_setup(struct evt_test *test, struct evt_options *opt)
 
 	if (opt->prod_type == EVT_PROD_TYPE_SYNT ||
 			opt->prod_type == EVT_PROD_TYPE_EVENT_TIMER_ADPTR) {
+		printf("Element size of mempool is %ld\n", sizeof(struct perf_elt));
 		t->pool = rte_mempool_create(test->name, /* mempool name */
 				opt->pool_sz, /* number of elements*/
 				sizeof(struct perf_elt), /* element size*/
@@ -1573,6 +2246,9 @@ perf_mempool_setup(struct evt_test *test, struct evt_options *opt)
 				0,
 				RTE_MBUF_DEFAULT_BUF_SIZE,
 				opt->socket_id); /* flags */
+
+		// debug:
+		// printf("[perf_mempool_setup]: the mempool start address is %p", t->pool->pool_data);
 
 	}
 

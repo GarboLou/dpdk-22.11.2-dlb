@@ -241,11 +241,20 @@ pipeline_launch_lcores(struct evt_test *test, struct evt_options *opt,
 	static uint64_t samples;
 
 	uint64_t prev_pkts = 0;
+    // struct rte_eth_stats stats;
 
 	while (t->done == false) {
 		const uint64_t new_cycles = rte_get_timer_cycles();
 
 		if ((new_cycles - perf_cycles) > perf_sample) {
+
+            // rte_eth_stats_get(0, &stats);
+            // uint64_t rx_pkts;
+            // for (uint16_t q = 0; q < opt->eth_queues; q++) {
+            //     rx_pkts = stats.q_ipackets[q];
+            //     printf("RX Queue %u Fullness: %" PRIu64 " packets\n", q, rx_pkts);
+            // }
+
 			const uint64_t curr_pkts = processed_pkts(t);
 
 			float mpps = (float)(curr_pkts - prev_pkts)/1000000;
@@ -325,8 +334,8 @@ pipeline_opt_check(struct evt_options *opt, uint64_t nb_queues)
 	return 0;
 }
 
-#define NB_RX_DESC			128
-#define NB_TX_DESC			512
+#define NB_RX_DESC			1024
+#define NB_TX_DESC			1024
 int
 pipeline_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 {
@@ -342,7 +351,8 @@ pipeline_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 		.rx_adv_conf = {
 			.rss_conf = {
 				.rss_key = NULL,
-				.rss_hf = RTE_ETH_RSS_IP,
+                /* MODIFY */
+				.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP,
 			},
 		},
 	};
@@ -412,7 +422,7 @@ pipeline_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 				local_port_conf.rx_adv_conf.rss_conf.rss_hf);
 		}
 
-		if (rte_eth_dev_configure(i, opt->eth_queues, nb_queues,
+		if (rte_eth_dev_configure(i, opt->eth_queues, opt->eth_queues,
 					  &local_port_conf) < 0) {
 			evt_err("Failed to configure eth port [%d]", i);
 			return -EINVAL;
@@ -424,17 +434,19 @@ pipeline_ethdev_setup(struct evt_test *test, struct evt_options *opt)
 				    opt->per_port_pool ? t->pool[i] :
 							      t->pool[0]) < 0) {
 				evt_err("Failed to setup eth port [%d] rx_queue: %d.",
-					i, 0);
+					i, j);
 				return -EINVAL;
 			}
 		}
 
-		if (rte_eth_tx_queue_setup(i, 0, NB_TX_DESC,
-					rte_socket_id(), NULL) < 0) {
-			evt_err("Failed to setup eth port [%d] tx_queue: %d.",
-					i, 0);
-			return -EINVAL;
-		}
+		for (j = 0; j < opt->eth_queues; j++) {
+            if (rte_eth_tx_queue_setup(i, j, NB_TX_DESC,
+                        rte_socket_id(), NULL) < 0) {
+                evt_err("Failed to setup eth port [%d] tx_queue: %d.",
+                        i, j);
+                return -EINVAL;
+            }
+        }
 
 		ret = rte_eth_promiscuous_enable(i);
 		if (ret != 0) {
@@ -569,35 +581,42 @@ pipeline_event_rx_adapter_setup(struct evt_options *opt, uint8_t stride,
 				return -EINVAL;
 			}
 		}
-		queue_conf.ev.queue_id = prod * stride;
-		ret = rte_event_eth_rx_adapter_create(prod, opt->dev_id,
-				&prod_conf);
-		if (ret) {
-			evt_err("failed to create rx adapter[%d]", prod);
-			return ret;
-		}
-		ret = rte_event_eth_rx_adapter_queue_add(prod, prod, -1,
-				&queue_conf);
-		if (ret) {
-			evt_err("failed to add rx queues to adapter[%d]", prod);
-			return ret;
-		}
 
-		if (!(cap & RTE_EVENT_ETH_RX_ADAPTER_CAP_INTERNAL_PORT)) {
-			uint32_t service_id = -1U;
+        uint16_t eth_dev_id = prod;
 
-			rte_event_eth_rx_adapter_service_id_get(prod,
-					&service_id);
-			ret = evt_service_setup(service_id);
-			if (ret) {
-				evt_err("Failed to setup service core"
-						" for Rx adapter");
-				return ret;
-			}
-		}
+        for (uint16_t q = 0; q < opt->eth_queues; q++) {
+            queue_conf.ev.queue_id = q;
+            ret = rte_event_eth_rx_adapter_create(q, opt->dev_id,
+                    &prod_conf);
+            if (ret) {
+                evt_err("failed to create rx adapter[%d]", q);
+                return ret;
+            }
+            ret = rte_event_eth_rx_adapter_queue_add(q, eth_dev_id, q,
+                    &queue_conf);
+            if (ret) {
+                evt_err("failed to add rx queues to adapter[%d]", q);
+                return ret;
+            }
 
-		evt_info("Port[%d] using Rx adapter[%d] configured", prod,
-				prod);
+            if (!(cap & RTE_EVENT_ETH_RX_ADAPTER_CAP_INTERNAL_PORT)) {
+                uint32_t service_id = -1U;
+
+                rte_event_eth_rx_adapter_service_id_get(q,
+                        &service_id);
+                evt_log("%s(): Setup service core... Service id is %d.", __func__, service_id);
+                ret = evt_service_setup(service_id);
+                if (ret) {
+                    evt_err("Failed to setup service core"
+                            " for Rx adapter");
+                    return ret;
+                }
+            }
+
+            evt_info("Port[%d] using Rx adapter[%d] configured", eth_dev_id,
+                    q);
+
+        }
 	}
 
 	return ret;
@@ -629,39 +648,43 @@ pipeline_event_tx_adapter_setup(struct evt_options *opt,
 			}
 		}
 
-		ret = rte_event_eth_tx_adapter_create(consm, opt->dev_id,
-				&port_conf);
-		if (ret) {
-			evt_err("failed to create tx adapter[%d]", consm);
-			return ret;
-		}
+        uint16_t eth_dev_id = consm;
+        for (uint16_t q = 0; q < opt->eth_queues; q++) {
+            ret = rte_event_eth_tx_adapter_create(q, opt->dev_id,
+                    &port_conf);
+            if (ret) {
+                evt_err("failed to create tx adapter[%d]", q);
+                return ret;
+            }
 
-		ret = rte_event_eth_tx_adapter_queue_add(consm, consm, -1);
-		if (ret) {
-			evt_err("failed to add tx queues to adapter[%d]",
-					consm);
-			return ret;
-		}
+            ret = rte_event_eth_tx_adapter_queue_add(q, eth_dev_id, q);
+            if (ret) {
+                evt_err("failed to add tx queues to adapter[%d]",
+                        q);
+                return ret;
+            }
 
-		if (!(cap & RTE_EVENT_ETH_TX_ADAPTER_CAP_INTERNAL_PORT)) {
-			uint32_t service_id = -1U;
+            if (!(cap & RTE_EVENT_ETH_TX_ADAPTER_CAP_INTERNAL_PORT)) {
+                uint32_t service_id = -1U;
 
-			ret = rte_event_eth_tx_adapter_service_id_get(consm,
-								   &service_id);
-			if (ret != -ESRCH && ret != 0) {
-				evt_err("Failed to get Tx adptr service ID");
-				return ret;
-			}
-			ret = evt_service_setup(service_id);
-			if (ret) {
-				evt_err("Failed to setup service core"
-						" for Tx adapter");
-				return ret;
-			}
-		}
+                ret = rte_event_eth_tx_adapter_service_id_get(q,
+                                    &service_id);
+                if (ret != -ESRCH && ret != 0) {
+                    evt_err("Failed to get Tx adptr service ID");
+                    return ret;
+                }
+                evt_log("%s(): Setup service core... Service id is %d.", __func__, service_id);
+                ret = evt_service_setup(service_id);
+                if (ret) {
+                    evt_err("Failed to setup service core"
+                            " for Tx adapter");
+                    return ret;
+                }
+            }
 
-		evt_info("Port[%d] using Tx adapter[%d] Configured", consm,
-				consm);
+            evt_info("Port[%d] using Tx adapter[%d] Configured", consm,
+                    q);
+        }
 	}
 
 	return ret;
@@ -710,7 +733,7 @@ pipeline_worker_cleanup(uint8_t dev, uint8_t port, struct rte_event ev[],
 		for (i = 0; i < deq; i++)
 			ev[i].op = RTE_EVENT_OP_RELEASE;
 
-		rte_event_enqueue_burst(dev, port, ev + enq, deq - enq);
+		rte_event_enqueue_burst(dev, port, ev, deq);
 	}
 
 	rte_event_port_quiesce(dev, port, pipeline_event_port_flush, NULL);
@@ -724,10 +747,11 @@ pipeline_ethdev_rx_stop(struct evt_test *test, struct evt_options *opt)
 
 	if (opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR) {
 		RTE_ETH_FOREACH_DEV(i) {
-			rte_event_eth_rx_adapter_stop(i);
-			rte_event_eth_rx_adapter_queue_del(i, i, -1);
-			for (j = 0; j < opt->eth_queues; j++)
+			for (j = 0; j < opt->eth_queues; j++) {
+    			rte_event_eth_rx_adapter_stop(j);
+    			rte_event_eth_rx_adapter_queue_del(j, i, j);
 				rte_eth_dev_rx_queue_stop(i, j);
+            }
 		}
 	}
 }
@@ -735,14 +759,16 @@ pipeline_ethdev_rx_stop(struct evt_test *test, struct evt_options *opt)
 void
 pipeline_ethdev_destroy(struct evt_test *test, struct evt_options *opt)
 {
-	uint16_t i;
+	uint16_t i, j;
 	RTE_SET_USED(test);
 	RTE_SET_USED(opt);
 
 	RTE_ETH_FOREACH_DEV(i) {
-		rte_event_eth_tx_adapter_stop(i);
-		rte_event_eth_tx_adapter_queue_del(i, i, -1);
-		rte_eth_dev_tx_queue_stop(i, 0);
+		for (j = 0; j < opt->eth_queues; j++) {
+            rte_event_eth_tx_adapter_stop(j);
+            rte_event_eth_tx_adapter_queue_del(j, i, j);
+            rte_eth_dev_tx_queue_stop(i, j);
+        }
 		rte_eth_dev_stop(i);
 	}
 }

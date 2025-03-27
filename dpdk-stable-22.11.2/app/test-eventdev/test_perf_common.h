@@ -243,6 +243,9 @@ perf_nb_event_ports(struct evt_options *opt)
 {
 	return evt_nr_active_lcores(opt->wlcores) +
 			evt_nr_active_lcores(opt->plcores);
+
+    /* TODO: need to allocate multiple cores for multiple Rx queues */
+    // return evt_nr_active_lcores(opt->wlcores) + 4;
 }
 
 int perf_test_result(struct evt_test *test, struct evt_options *opt);

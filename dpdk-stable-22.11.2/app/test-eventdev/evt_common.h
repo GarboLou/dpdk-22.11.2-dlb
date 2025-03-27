@@ -23,6 +23,10 @@
 #define evt_info(fmt, args...) \
 	fprintf(stdout, CLYEL""fmt CLNRM "\n", ## args)
 
+#define evt_log(fmt, args...) \
+    fprintf(stdout, "\033[1;36m"""fmt"\033[0m\n", ## args);
+
+
 #define EVT_STR_FMT 20
 
 #define evt_dump(str, fmt, val...) \
@@ -36,6 +40,8 @@
 #define EVT_MAX_PORTS            256
 #define EVT_MAX_QUEUES           256
 #define EVT_MAX_PRODUCERS        8
+
+static uint64_t tsc_hz = 0;
 
 enum evt_prod_type {
 	EVT_PROD_TYPE_NONE,
@@ -51,6 +57,7 @@ struct evt_options {
 	char test_name[EVT_TEST_NAME_MAX_LEN];
 	bool plcores[RTE_MAX_LCORE];
 	bool wlcores[RTE_MAX_LCORE];
+    int wlcore_idx[RTE_MAX_LCORE];
 	uint8_t nb_dir_queues;
 	uint8_t dir_queue_ids[RTE_EVENT_MAX_QUEUES_PER_DEV];
 	uint8_t lb_queue_ids[RTE_EVENT_MAX_QUEUES_PER_DEV];
@@ -87,6 +94,13 @@ struct evt_options {
 	enum evt_prod_type prod_type;
 	enum rte_event_crypto_adapter_mode crypto_adptr_mode;
 	enum rte_crypto_op_type crypto_op_type;
+	// ==== customized options
+	uint16_t call_main;
+    uint16_t nb_rx_adapters;
+    uint16_t nb_tx_adapters;
+    uint16_t e2e_latency;
+    uint64_t dummy_delay;
+    uint16_t use_dlb;
 };
 
 static inline bool
@@ -157,9 +171,14 @@ evt_service_setup(uint32_t service_id)
 			lcore = core_array[core_cnt];
 			min_cnt = cnt;
 		}
+
+        // if (rte_service_map_lcore_set(service_id, core_array[core_cnt], 1))
+		//     return -ENOENT;
 	}
 	if (rte_service_map_lcore_set(service_id, lcore, 1))
 		return -ENOENT;
+
+    evt_log("Service lcore %d is in use for service #%d", lcore, service_id);
 
 	return 0;
 }
@@ -252,4 +271,30 @@ evt_configure_eventdev_with_adapter(struct evt_options *opt, uint8_t nb_queues,
 	config.nb_event_ports += config.nb_single_link_event_port_queues;
 	return rte_event_dev_configure(opt->dev_id, &config);
 }
+
+static inline void delay_nanoseconds(uint64_t nanoseconds) {
+    uint64_t start_time, end_time;
+    uint64_t elapsed_nanoseconds;
+    uint64_t cycles = nanoseconds;
+    // printf("hz: %lu, nanoseconds: %lu\n", tsc_hz, nanoseconds);
+
+    start_time = rte_get_timer_cycles();
+    do {
+        end_time = rte_get_timer_cycles();
+        elapsed_nanoseconds = end_time - start_time;
+    } while (elapsed_nanoseconds < cycles);
+}
+
+static inline void delay_cycles(uint64_t cycles) {
+    uint64_t start_time, end_time;
+    uint64_t elapsed_nanoseconds;
+
+    start_time = rte_get_timer_cycles();
+    do {
+        end_time = rte_get_timer_cycles();
+        elapsed_nanoseconds = end_time - start_time;
+    } while (elapsed_nanoseconds < cycles);
+}
+
+
 #endif /*  _EVT_COMMON_*/

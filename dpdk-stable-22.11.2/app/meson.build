@@ -30,6 +30,9 @@ apps = [
         'test-regex',
         'test-sad',
         'test-security-perf',
+        'distributor-original',
+        'distributor-e2e',
+        'distributor-c2c',
 ]
 
 default_cflags = machine_args + ['-DALLOW_EXPERIMENTAL_API']

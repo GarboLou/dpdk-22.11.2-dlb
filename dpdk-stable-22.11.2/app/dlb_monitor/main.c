@@ -18,8 +18,6 @@
 
 /* Note: port_queue_id in xstats APIs is 8 bits, hence maximum of 256 */
 #define MAX_PORTS_QUEUES 256
-#define DLB2_HW_V2 0
-#define DLB2_HW_V2_5 1
 static uint32_t num_ports;
 static uint32_t num_queues;
 static struct rte_event_port_conf port_confs[MAX_PORTS_QUEUES];
@@ -92,7 +90,6 @@ static const char * const dev_xstat_strs[] = {
 	"dev_ldb_pool_size",
 	"dev_dir_pool_size",
 	"dev_pool_size",
-	"dev_hw_version",
 };
 
 enum dlb_dev_xstats {
@@ -101,7 +98,6 @@ enum dlb_dev_xstats {
 	DEV_LDB_POOL_SIZE,
 	DEV_DIR_POOL_SIZE,
 	DEV_POOL_SIZE,
-	DEV_HW_VERSION,
 };
 
 static const char * const port_xstat_strs[] = {
@@ -448,15 +444,6 @@ collect_config(void)
 				       1);
 	if (ret != 1)
 		rte_panic("Failed to get pool size\n");
-
-	ret = rte_event_dev_xstats_get(dev_id,
-				       RTE_EVENT_DEV_XSTATS_DEVICE,
-				       0,
-				       &dev_xstat_ids[DEV_HW_VERSION],
-				       &dev_xstat_vals[DEV_HW_VERSION],
-				       1);
-	if (ret != 1)
-		rte_panic("Failed to get hw version\n");
 }
 
 static void
@@ -475,6 +462,9 @@ collect_stats(void)
 
 		port_links[i].num_links = ret;
 	}
+
+	/* Wait while the eventdev application executes */
+	rte_delay_us_sleep(measure_time_us);
 
 	/* Collect xstats */
 	ret = rte_event_dev_xstats_get(dev_id,
@@ -664,29 +654,19 @@ display_device_config(void)
 {
 	printf("\n");
 	printf("          Device Configuration\n");
-	if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2) {
-		printf("-----------------------------------------\n");
-		printf("      |  LDB pool size |  DIR pool size |\n");
-		printf("Device|    (DLB 2.0)   |    (DLB 2.0)   |\n");
-		printf("------|----------------|----------------|\n");
+	printf("-----------------------------------------------------------\n");
+	printf("      |  LDB pool size |  DIR pool size |  COMB pool size |\n");
+	printf("Device|    (DLB 2.0)   |    (DLB 2.0)   |     (DLB 2.5)   |\n");
+	printf("------|----------------|----------------|-----------------|\n");
 
-		printf("  %2u  |     %5"PRIu64"      |      %4"PRIu64"      |\n",
-			dev_id,
-			dev_xstat_vals[DEV_LDB_POOL_SIZE],
-			dev_xstat_vals[DEV_DIR_POOL_SIZE]);
-		printf("-----------------------------------------\n");
-	}
-	else if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2_5) {
-                printf("-------------------------\n");
-                printf("      |  COMB pool size |\n");
-                printf("Device|     (DLB 2.5)   |\n");  
-                printf("------|-----------------|\n");
-
-                printf("  %2u  |     %5"PRIu64"       |\n",     
-                        dev_id, 
-                        dev_xstat_vals[DEV_POOL_SIZE]);
-                printf("-------------------------\n");
-        }
+	printf("  %2u  |     %5"PRIu64"      |      %4"PRIu64"      |",
+		dev_id,
+		dev_xstat_vals[DEV_LDB_POOL_SIZE],
+		dev_xstat_vals[DEV_DIR_POOL_SIZE]);
+	printf("      %5"PRIu64"      |\n",
+		dev_xstat_vals[DEV_POOL_SIZE]);
+	printf("-----------------------------------------------------------\n");
+	printf("\n");
 }
 
 static void
@@ -866,10 +846,9 @@ display_port_dequeue_stats(void)
 		format_percent_str(par_pct, par_str);
 		format_percent_str(dir_pct, dir_str);
 
+		avg_deq_size = (float)rx_ok / (float)total_polls;
 		if (total_polls == 0)
 			avg_deq_size = 0.0f;
-		else
-			avg_deq_size = (float)rx_ok / (float)total_polls;
 
 		/* Throughput is displayed in millions of events per second, so
 		 * no need to convert microseconds to seconds.
@@ -934,14 +913,9 @@ display_port_enqueue_stats(void)
 	printf("-----------------------------------------------------------------------------------------------\n");
 	printf("    |                |   Enqueued sched   |     Enqueued op    |    %% of enqueue attempts     |\n");
 	printf("    |  Total events  |   type percentage  |   type percentage  |          backpressured       |\n");
-	if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2) {
-		printf("Port|    enqueued    | ATM  PAR  ORD  DIR | NEW  FWD  REL      |  LDB   DIR   NET   INF   SWC |\n");
-	}
-	else if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2_5) {	
-		printf("Port|    enqueued    | ATM  PAR  ORD  DIR | NEW  FWD  REL      |  COMB    NET    INF    SWC   |\n");
-	}
+	printf("Port|    enqueued    | ATM  PAR  ORD  DIR | NEW  FWD  REL      | LDB  DIR  COMB NET  INF  SWC |\n");
 	printf("----|----------------|--------------------|--------------------|------------------------------|\n");
-	
+
 	for (i = 0; i < num_ports; i++) {
 		char ldb_bp_str[PCT_STR_LEN], dir_bp_str[PCT_STR_LEN];
 		char comb_bp_str[PCT_STR_LEN];
@@ -1057,66 +1031,46 @@ display_port_enqueue_stats(void)
 		format_percent_str(net_bp_pct, net_bp_str);
 		format_percent_str(inf_bp_pct, inf_bp_str);
 		format_percent_str(swc_bp_pct, swc_bp_str);
-		
-		if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2) {
-			printf("%3u |%16"PRIu64"|%s %s %s %s |%s%s%s %s %s%s%s      | %s  %s  %s%s%s  %s  %s |\n",
-				i,
-				tx_ok,
-				atm_str, par_str, ord_str, dir_str,
-				new_rel_issue ? COL_RED : "", new_str, COL_RESET,
-				fwd_str,
-				new_rel_issue ? COL_RED : "", rel_str, COL_RESET,
-				ldb_bp_str,
-				dir_bp_str,
-				net_bp_pct > 25.0f ? COL_RED : "", net_bp_str,
-				COL_RESET,
-				inf_bp_str,
-				swc_bp_str);
-		}
-		else if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2_5) {			
-			printf("%3u |%16"PRIu64"|%s %s %s %s |%s%s%s %s %s%s%s      | %s    %s%s%s   %s   %s   |\n",
-				i,
-				tx_ok,
-				atm_str, par_str, ord_str, dir_str,
-				new_rel_issue ? COL_RED : "", new_str, COL_RESET,
-				fwd_str,
-				new_rel_issue ? COL_RED : "", rel_str, COL_RESET,
-				comb_bp_str,
-				net_bp_pct > 25.0f ? COL_RED : "", net_bp_str,
-				COL_RESET,
-				inf_bp_str,
-				swc_bp_str);	
-		}
+
+		printf("%3u |%16"PRIu64"|%s %s %s %s |%s%s%s %s %s%s%s      |%s %s %s %s%s%s %s %s |\n",
+			i,
+			tx_ok,
+			atm_str, par_str, ord_str, dir_str,
+			new_rel_issue ? COL_RED : "", new_str, COL_RESET,
+			fwd_str,
+			new_rel_issue ? COL_RED : "", rel_str, COL_RESET,
+			ldb_bp_str,
+			dir_bp_str,
+			comb_bp_str,
+			net_bp_pct > 25.0f ? COL_RED : "", net_bp_str,
+			COL_RESET,
+			inf_bp_str,
+			swc_bp_str);
 	}
 
 	printf("-----------------------------------------------------------------------------------------------\n");
 
-	if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2) {
-	
-		if (print_ldb)
-			printf("\nLDB backpressure: insufficient load-balanced hardware credits. Can occur\n"
+	if (print_ldb)
+		printf("\nLDB backpressure: insufficient load-balanced hardware credits. Can occur\n"
 		       "                  occasionally when enqueueing faster than DLB refills credits.\n");
-		if (print_ldb_deadlock)
-			printf("\n                  A high LDB%% may be caused by credit deadlock. Threads should\n"
+	if (print_ldb_deadlock)
+		printf("\n                  A high LDB%% may be caused by credit deadlock. Threads should\n"
 		       "                  retry enqueue with a retry limit, and drop any unsent events\n"
 		       "                  if the limit is reached to release credits.\n");
-		if (print_dir)
-			printf("\nDIR backpressure: insufficient directed hardware credits. Can occur\n"
+	if (print_dir)
+		printf("\nDIR backpressure: insufficient directed hardware credits. Can occur\n"
 		       "                  occasionally when enqueueing faster than DLB refills credits.\n");
-		if (print_dir_deadlock)
-			printf("\n                  A high DIR%% may be caused by credit deadlock. Threads should\n"
+	if (print_dir_deadlock)
+		printf("\n                  A high DIR%% may be caused by credit deadlock. Threads should\n"
 		       "                  retry enqueue with a retry limit, and drop any unsent events\n"
 		       "                  if the limit is reached to release credits.\n");
-	}
-	else if(dev_xstat_vals[DEV_HW_VERSION] == DLB2_HW_V2_5) {
-		if (print_comb)
-			printf("\nCOMB backpressure: insufficient hardware credits. Can occur\n"
+	if (print_comb)
+		printf("\nCOMB backpressure: insufficient hardware credits. Can occur\n"
 		       "                  occasionally when enqueueing faster than DLB refills credits.\n");
-		if (print_comb_deadlock)
-			printf("\n                  A high COMB%% may be caused by credit deadlock. Threads should\n"
+	if (print_comb_deadlock)
+		printf("\n                  A high COMB%% may be caused by credit deadlock. Threads should\n"
 		       "                  retry enqueue with a retry limit, and drop any unsent events\n"
 		       "                  if the limit is reached to release credits.\n");
-	}
 	if (print_net)
 		printf("\nNET backpressure: unable to enqueue NEW events because inflight events exceeded\n"
 		       "                  the port's New Event Threshold. Indicates the events are being\n"
@@ -1307,10 +1261,6 @@ main(int argc, char **argv)
 			for (i = 0; i < MAX_PORTS_QUEUES; i++)
 				prev_sched_throughput[i] = 0;
 		}
-		/* Wait while the eventdev application executes */
-		rte_delay_us_sleep(measure_time_us);
-
-		do_watch = rte_eal_primary_proc_alive(NULL);
 	} while (do_watch);
 
 	return 0;

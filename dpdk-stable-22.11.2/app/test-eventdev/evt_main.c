@@ -13,10 +13,10 @@
 
 #include "evt_options.h"
 #include "evt_test.h"
+#include "test_perf_common.h"
 
 struct evt_options opt;
 struct evt_test *test;
-static rte_atomic32_t evt_dest = RTE_ATOMIC32_INIT(0);
 
 static void
 signal_handler(int signum)
@@ -28,11 +28,14 @@ signal_handler(int signum)
 		if (test != NULL) {
 			/* request all lcores to exit from the main loop */
 			*(int *)test->test_priv = true;
+			struct test_perf *t = evt_test_priv(test);
+			t->done = true;
 			rte_wmb();
 		}
-	} else if (signum == SIGALRM && test->ops.eventdev_destroy &&
-		   rte_atomic32_test_and_set(&evt_dest)) {
-		test->ops.eventdev_destroy(test, &opt);
+	} else if (signum == SIGALRM) {
+		if (test->ops.eventdev_destroy)
+			test->ops.eventdev_destroy(test, &opt);
+		test->ops.eventdev_destroy = NULL;
 	}
 }
 
@@ -113,6 +116,24 @@ main(int argc, char **argv)
 	if (opt.verbose_level)
 		evt_options_dump_all(test, &opt);
 
+		
+	// ========================================
+	for (int i = 0; i < 64; i++) {
+		for (int j = 0; j < 64; j++) {
+        	wlcore_queue_pkts[i][j] = 0;
+            c2c_latency_array[i][j] = 0;
+		}
+    }
+	// CHECK HARDWARE PARAMETERS
+	struct rte_event_dev_info dev_info;
+	rte_event_dev_info_get(opt.dev_id, &dev_info);
+	printf("\033[1;36mMax enqueue burst size is %d\033[0m\n", dev_info.max_event_port_enqueue_depth);
+	
+	// CHECK nb_stages
+	printf("\033[1;36mNumber of stage to be processed is %d\033[0m\n", opt.nb_stages);
+	// ========================================
+
+
 	/* Test specific setup */
 	if (test->ops.test_setup) {
 		if (test->ops.test_setup(test, &opt))  {
@@ -180,8 +201,7 @@ main(int argc, char **argv)
 	if (test->ops.ethdev_destroy)
 		test->ops.ethdev_destroy(test, &opt);
 
-	/* Destroy eventdev if not already done by alarm handler*/
-	if (test->ops.eventdev_destroy && rte_atomic32_test_and_set(&evt_dest))
+	if (test->ops.eventdev_destroy)
 		test->ops.eventdev_destroy(test, &opt);
 
 	if (test->ops.cryptodev_destroy)
@@ -192,6 +212,7 @@ main(int argc, char **argv)
 
 	if (test->ops.test_destroy)
 		test->ops.test_destroy(test, &opt);
+	
 
 nocap:
 	if (ret == EVT_TEST_SUCCESS) {

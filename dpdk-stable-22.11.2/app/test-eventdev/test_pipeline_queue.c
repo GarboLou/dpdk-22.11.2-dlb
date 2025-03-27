@@ -112,6 +112,26 @@ pipeline_queue_worker_single_stage_burst_fwd(void *arg)
 	const uint8_t *tx_queue = t->tx_evqueue_id;
 	uint16_t nb_rx = 0, nb_tx = 0;
 
+    /* Get ethernet port 0 MAC addr */
+    struct rte_ether_addr my_ether_addr;
+    int retval = rte_eth_macaddr_get(0, &my_ether_addr);
+    if (retval != 0) {
+        fprintf(stderr, "Error during rte_eth_macaddr_get\n");
+        return retval;
+    }
+    printf("lcore %d Port %hu MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+           " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+           rte_lcore_id(), 0, my_ether_addr.addr_bytes[0], my_ether_addr.addr_bytes[1], my_ether_addr.addr_bytes[2],
+           my_ether_addr.addr_bytes[3], my_ether_addr.addr_bytes[4], my_ether_addr.addr_bytes[5]);
+    
+    /* Time */
+    uint64_t hz = rte_get_timer_hz();
+    // MODIFY HERE: TEST LATENCY PERIOD
+    uint16_t interval = 1;  // unit of s
+    uint64_t interval_cycles = (uint64_t) (interval * hz / 1000.0);
+    uint64_t prev_tsc, cur_tsc, diff_tsc;
+    prev_tsc = rte_get_timer_cycles();
+
 	while (t->done == false) {
 		nb_rx = rte_event_dequeue_burst(dev, port, ev, BURST_SIZE, 0);
 
@@ -120,11 +140,25 @@ pipeline_queue_worker_single_stage_burst_fwd(void *arg)
 			continue;
 		}
 
+        cur_tsc = rte_get_timer_cycles();
+        diff_tsc = cur_tsc - prev_tsc;
+
 		for (i = 0; i < nb_rx; i++) {
 			rte_prefetch0(ev[i + 1].mbuf);
 			ev[i].queue_id = tx_queue[ev[i].mbuf->port];
+            // evt_log("enqueue id is %d", ev[i].queue_id);
+
+            /* MODIFY: modify the payload content */
+            if (diff_tsc > interval_cycles) {
+                struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(ev[i].mbuf, struct rte_ether_hdr *);
+                rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+                rte_ether_addr_copy(&my_ether_addr, &eth_hdr->src_addr);
+                prev_tsc = cur_tsc;
+            }
+            //======================================
+
 			rte_event_eth_tx_adapter_txq_set(ev[i].mbuf, 0);
-			pipeline_fwd_event(&ev[i], RTE_SCHED_TYPE_ATOMIC);
+			// pipeline_fwd_event(&ev[i], RTE_SCHED_TYPE_ATOMIC);
 		}
 
 		nb_tx = pipeline_event_enqueue_burst(dev, port, ev, nb_rx, t);
@@ -594,6 +628,8 @@ worker_wrapper(void *arg)
 		[1][1][1] = pipeline_queue_worker_multi_stage_burst_tx_vector,
 	};
 
+    // printf("vector %d, burst %d, internal_port %d.\n", opt->ena_vector, burst, internal_port);
+
 	if (nb_stages == 1)
 		return (pipeline_queue_worker_single_stage[opt->ena_vector]
 							  [burst]
@@ -629,10 +665,10 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	struct test_pipeline *t = evt_test_priv(test);
 
 	nb_ports = evt_nr_active_lcores(opt->wlcores);
-	nb_queues = rte_eth_dev_count_avail() * (nb_stages);
+	// nb_queues = rte_eth_dev_count_avail() * (nb_stages);
 
 	/* One queue for Tx adapter per port */
-	nb_queues += rte_eth_dev_count_avail();
+	// nb_queues += rte_eth_dev_count_avail();
 
 	memset(tx_evqueue_id, 0, sizeof(uint8_t) * RTE_MAX_ETHPORTS);
 	memset(queue_arr, 0, sizeof(uint8_t) * RTE_EVENT_MAX_QUEUES_PER_DEV);
@@ -642,7 +678,10 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	/* Pass ethdev count to eventdev configuration to set single-link
 	 * port count. 1 single-link port to be configured per ethdev.
 	 */
-	ret = evt_configure_eventdev_with_adapter(opt, nb_queues, nb_ports, rte_eth_dev_count_avail());
+	// ret = evt_configure_eventdev_with_adapter(opt, nb_queues, nb_ports, rte_eth_dev_count_avail());
+
+    nb_queues = opt->eth_queues * 2;
+    ret = evt_configure_eventdev_with_adapter(opt, nb_queues, nb_ports, opt->eth_queues);
 	if (ret) {
 		evt_err("failed to configure eventdev %d", opt->dev_id);
 		return ret;
@@ -654,12 +693,14 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 			.nb_atomic_order_sequences = opt->nb_flows,
 	};
 	/* queue configurations */
+    evt_log("Total number of queues is %d.", nb_queues);
 	for (queue = 0; queue < nb_queues; queue++) {
 		uint8_t slot;
 
 		q_conf.event_queue_cfg = 0;
 		slot = queue % (nb_stages + 1);
-		if (slot == nb_stages) {
+		if (queue >= opt->eth_queues) {
+            // later queues are for Tx
 			q_conf.schedule_type = RTE_SCHED_TYPE_ATOMIC;
 			if (!t->internal_port) {
 				q_conf.event_queue_cfg =
@@ -694,12 +735,12 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 				nb_worker_queues, p_conf);
 		if (ret)
 			return ret;
-	} else
+	} else {
 		ret = pipeline_event_port_setup(test, opt, NULL, nb_queues,
 				p_conf);
-
-	if (ret)
-		return ret;
+        if (ret)
+            return ret;
+    }
 	/*
 	 * The pipelines are setup in the following manner:
 	 *
@@ -727,6 +768,7 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	if (!evt_has_distributed_sched(opt->dev_id)) {
 		uint32_t service_id;
 		rte_event_dev_service_id_get(opt->dev_id, &service_id);
+        evt_log("%s(): Setup service core... Service id is %d.", __func__, service_id);
 		ret = evt_service_setup(service_id);
 		if (ret) {
 			evt_err("No service lcore found to run event dev.");
@@ -737,21 +779,23 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	/* Connect the tx_evqueue_id to the Tx adapter port */
 	if (!t->internal_port) {
 		RTE_ETH_FOREACH_DEV(prod) {
-			ret = rte_event_eth_tx_adapter_event_port_get(prod,
-					&tx_evport_id);
-			if (ret) {
-				evt_err("Unable to get Tx adptr[%d] evprt[%d]",
-						prod, tx_evport_id);
-				return ret;
-			}
+            for (uint16_t q = 0; q < opt->eth_queues; q++) {
+                ret = rte_event_eth_tx_adapter_event_port_get(q,
+                        &tx_evport_id);
+                if (ret) {
+                    evt_err("Unable to get Tx adptr[%d] evprt[%d]",
+                            q, tx_evport_id);
+                    return ret;
+                }
 
-			if (rte_event_port_link(opt->dev_id, tx_evport_id,
-						&tx_evqueue_id[prod],
-						NULL, 1) != 1) {
-				evt_err("Unable to link Tx adptr[%d] evprt[%d]",
-						prod, tx_evport_id);
-				return ret;
-			}
+                if (rte_event_port_link(opt->dev_id, tx_evport_id,
+                            &tx_evqueue_id[q],
+                            NULL, 1) != 1) {
+                    evt_err("Unable to link Tx adptr[%d] evprt[%d]",
+                            q, tx_evport_id);
+                    return ret;
+                }
+            }
 		}
 	}
 
@@ -773,17 +817,19 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	}
 
 	RTE_ETH_FOREACH_DEV(prod) {
-		ret = rte_event_eth_rx_adapter_start(prod);
-		if (ret) {
-			evt_err("Rx adapter[%d] start failed", prod);
-			return ret;
-		}
+        for (uint16_t q = 0; q < opt->eth_queues; q++) {
+            ret = rte_event_eth_rx_adapter_start(q);
+            if (ret) {
+                evt_err("Rx adapter[%d] start failed", q);
+                return ret;
+            }
 
-		ret = rte_event_eth_tx_adapter_start(prod);
-		if (ret) {
-			evt_err("Tx adapter[%d] start failed", prod);
-			return ret;
-		}
+            ret = rte_event_eth_tx_adapter_start(q);
+            if (ret) {
+                evt_err("Tx adapter[%d] start failed", q);
+                return ret;
+            }
+        }
 	}
 
 	memcpy(t->tx_evqueue_id, tx_evqueue_id, sizeof(uint8_t) *

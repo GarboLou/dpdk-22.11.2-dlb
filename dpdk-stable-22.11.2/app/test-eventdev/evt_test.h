@@ -11,6 +11,9 @@
 
 #include <rte_eal.h>
 
+static volatile uint64_t wlcore_queue_pkts[64][64];
+static volatile uint64_t c2c_latency_array[64][64];
+
 enum evt_test_result {
 	EVT_TEST_SUCCESS,
 	EVT_TEST_FAILED,

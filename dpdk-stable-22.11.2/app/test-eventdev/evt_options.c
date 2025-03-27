@@ -21,7 +21,7 @@ void
 evt_options_default(struct evt_options *opt)
 {
 	memset(opt, 0, sizeof(*opt));
-	opt->verbose_level = 1; /* Enable minimal prints */
+	opt->verbose_level = 2; /* Enable minimal prints */
 	opt->dev_id = 0;
 	strncpy(opt->test_name, "order_queue", EVT_TEST_NAME_MAX_LEN);
 	opt->nb_flows = 1024;
@@ -37,9 +37,15 @@ evt_options_default(struct evt_options *opt)
 	opt->expiry_nsec = 1E4;   /* 10000ns ~10us */
 	opt->prod_type = EVT_PROD_TYPE_SYNT;
 	opt->eth_queues = 1;
+	opt->ena_vector = 0;
 	opt->vector_size = 64;
 	opt->vector_tmo_nsec = 100E3;
 	opt->crypto_op_type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+	opt->nb_rx_adapters = 1;
+	opt->nb_tx_adapters = 1;
+    opt->e2e_latency = 0;
+    opt->nb_stages = 1;
+    opt->dummy_delay = 0;
 }
 
 typedef int (*option_parser_t)(struct evt_options *opt,
@@ -125,6 +131,48 @@ evt_parse_tx_pkt_sz(struct evt_options *opt, const char *arg __rte_unused)
 
 	ret = parser_read_uint16(&(opt->tx_pkt_sz), arg);
 
+	return ret;
+}
+
+static int
+evt_parse_call_main(struct evt_options *opt, const char *arg __rte_unused)
+{
+	int ret;
+	ret = parser_read_uint16(&(opt->call_main), arg);
+	return ret;
+}
+
+
+static int
+evt_parse_nb_rx_adapters(struct evt_options *opt, const char *arg __rte_unused)
+{
+	int ret;
+	ret = parser_read_uint16(&(opt->nb_rx_adapters), arg);
+	return ret;
+}
+
+
+static int
+evt_parse_nb_tx_adapters(struct evt_options *opt, const char *arg __rte_unused)
+{
+	int ret;
+	ret = parser_read_uint16(&(opt->nb_tx_adapters), arg);
+	return ret;
+}
+
+static int
+evt_parse_e2e_latency(struct evt_options *opt, const char *arg __rte_unused)
+{
+	int ret;
+	ret = parser_read_uint16(&(opt->e2e_latency), arg);
+	return ret;
+}
+
+static int
+evt_parse_dummy_delay(struct evt_options *opt, const char *arg __rte_unused)
+{
+	int ret;
+	ret = parser_read_uint16(&(opt->dummy_delay), arg);
 	return ret;
 }
 
@@ -276,7 +324,7 @@ evt_parse_plcores(struct evt_options *opt, const char *corelist)
 {
 	int ret;
 
-	ret = parse_lcores_list(opt->plcores, RTE_MAX_LCORE, corelist);
+	ret = parse_lcores_list(opt->plcores, NULL, RTE_MAX_LCORE, corelist);
 	if (ret == -E2BIG)
 		evt_err("duplicate lcores in plcores");
 
@@ -288,7 +336,7 @@ evt_parse_work_lcores(struct evt_options *opt, const char *corelist)
 {
 	int ret;
 
-	ret = parse_lcores_list(opt->wlcores, RTE_MAX_LCORE, corelist);
+	ret = parse_lcores_list(opt->wlcores, opt->wlcore_idx, RTE_MAX_LCORE, corelist);
 	if (ret == -E2BIG)
 		evt_err("duplicate lcores in wlcores");
 
@@ -369,6 +417,13 @@ evt_parse_prod_enq_burst_sz(struct evt_options *opt, const char *arg)
 	return ret;
 }
 
+static int
+evt_parse_use_dlb(struct evt_options *opt, const char *arg)
+{
+	opt->use_dlb = 1;
+	return 0;
+}
+
 static void
 usage(char *program)
 {
@@ -415,7 +470,12 @@ usage(char *program)
 		"\t--tx_first         : Transmit given number of packets\n"
 		"                       across all the ethernet devices before\n"
 		"                       event workers start.\n"
-		"\t--tx_pkt_sz        : Packet size to use with Tx first."
+		"\t--tx_pkt_sz        : Packet size to use with Tx first.\n"
+		"\t--nb_rx_adapters     : Number of rx cores to be used.\n"
+		"\t--nb_tx_adapters     : Number of tx cores to be used.\n"
+		"\t--e2e_latency        : Enable end-to-end latency measurement.\n"
+		"\t--dummy_delay        : Add dummy processing delay (in nanosecond).\n"
+		"\t--use_dlb          : Use Intel Dynamic Load Balancer."
 		);
 	printf("available tests:\n");
 	evt_test_dump_names();
@@ -499,6 +559,10 @@ static struct option lgopts[] = {
 	{ EVT_HELP,                0, 0, 0 },
 	{ EVT_TX_FIRST,            1, 0, 0 },
 	{ EVT_TX_PKT_SZ,           1, 0, 0 },
+	{ EVT_NB_RX_ADAPTERS,      1, 0, 0 },
+	{ EVT_NB_TX_ADAPTERS,      1, 0, 0 },
+	{ EVT_E2E_LATENCY,         1, 0, 0 },
+	{ EVT_DUMMY_DELAY,         1, 0, 0 },
 	{ NULL,                    0, 0, 0 }
 };
 
@@ -543,6 +607,12 @@ evt_opts_parse_long(int opt_idx, struct evt_options *opt)
 		{ EVT_PER_PORT_POOL, evt_parse_per_port_pool},
 		{ EVT_TX_FIRST, evt_parse_tx_first},
 		{ EVT_TX_PKT_SZ, evt_parse_tx_pkt_sz},
+		{ EVT_CALL_MAIN, evt_parse_call_main},
+		{ EVT_NB_RX_ADAPTERS, evt_parse_nb_rx_adapters},
+		{ EVT_NB_TX_ADAPTERS, evt_parse_nb_tx_adapters},
+		{ EVT_E2E_LATENCY, evt_parse_e2e_latency},
+		{ EVT_DUMMY_DELAY, evt_parse_dummy_delay},
+		{ EVT_USE_DLB, evt_parse_use_dlb},
 	};
 
 	for (i = 0; i < RTE_DIM(parsermap); i++) {
