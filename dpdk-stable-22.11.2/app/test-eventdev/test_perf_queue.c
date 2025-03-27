@@ -12,7 +12,13 @@ perf_queue_nb_event_queues(struct evt_options *opt)
 	/* nb_queues = number of producers * number of stages */
 	uint8_t nb_prod = opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR ?
 		rte_eth_dev_count_avail() : evt_nr_active_lcores(opt->plcores);
-	return nb_prod * opt->nb_stages;
+	/* Directed ports need to be linked to directed queues. So increase the
+	 * number of queues by number of producers.
+	 */
+	if (opt->nb_dir_queues)
+		return nb_prod * (opt->nb_stages + 1);
+	else
+		return nb_prod * opt->nb_stages;
 }
 
 static __rte_always_inline void
@@ -88,6 +94,7 @@ perf_queue_worker_burst(void *arg, const int enable_fwd_latency)
 	uint16_t i;
 
 	while (t->done == false) {
+		enq = 0;
 		nb_rx = rte_event_dequeue_burst(dev, port, ev, BURST_SIZE, 0);
 
 		if (!nb_rx) {
@@ -124,8 +131,6 @@ perf_queue_worker_burst(void *arg, const int enable_fwd_latency)
 			}
 		}
 
-
-		enq = rte_event_enqueue_burst(dev, port, ev, nb_rx);
 		while (enq < nb_rx && !t->done) {
 			enq += rte_event_enqueue_burst(dev, port,
 							ev + enq, nb_rx - enq);
@@ -178,9 +183,11 @@ perf_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	struct test_perf *t = evt_test_priv(test);
 
 	nb_ports = evt_nr_active_lcores(opt->wlcores);
-	nb_ports += opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR ||
-		opt->prod_type == EVT_PROD_TYPE_EVENT_TIMER_ADPTR ? 0 :
-		evt_nr_active_lcores(opt->plcores);
+	if (opt->prod_type != EVT_PROD_TYPE_ETH_RX_ADPTR &&
+	    opt->prod_type != EVT_PROD_TYPE_EVENT_TIMER_ADPTR) {
+		nb_ports += evt_nr_active_lcores(opt->plcores);
+		opt->nb_dir_queues = evt_nr_active_lcores(opt->plcores);
+	}
 
 	nb_queues = perf_queue_nb_event_queues(opt);
 
@@ -201,22 +208,28 @@ perf_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 			.nb_atomic_flows = opt->nb_flows,
 			.nb_atomic_order_sequences = opt->nb_flows,
 	};
+	uint8_t num_lb_q = 0, num_dir_q = 0;
 	/* queue configurations */
 	for (queue = 0; queue < nb_queues; queue++) {
-		q_conf.schedule_type =
-			(opt->sched_type_list[queue % nb_stages]);
-
-		if (opt->q_priority) {
-			uint8_t stage_pos = queue % nb_stages;
-			/* Configure event queues(stage 0 to stage n) with
-			 * RTE_EVENT_DEV_PRIORITY_LOWEST to
-			 * RTE_EVENT_DEV_PRIORITY_HIGHEST.
-			 */
-			uint8_t step = RTE_EVENT_DEV_PRIORITY_LOWEST /
-					(nb_stages - 1);
-			/* Higher prio for the queues closer to last stage */
-			q_conf.priority = RTE_EVENT_DEV_PRIORITY_LOWEST -
-					(step * stage_pos);
+		if (queue >= (nb_queues - opt->nb_dir_queues)) {
+			q_conf.event_queue_cfg = RTE_EVENT_QUEUE_CFG_SINGLE_LINK;
+			opt->dir_queue_ids[num_dir_q++] = queue;
+		} else {
+			q_conf.schedule_type =
+				(opt->sched_type_list[queue % nb_stages]);
+			if (opt->q_priority) {
+				uint8_t stage_pos = queue % nb_stages;
+				/* Configure event queues(stage 0 to stage n) with
+				 * RTE_EVENT_DEV_PRIORITY_LOWEST to
+				 * RTE_EVENT_DEV_PRIORITY_HIGHEST.
+				 */
+				uint8_t step = RTE_EVENT_DEV_PRIORITY_LOWEST /
+							   (nb_stages - 1);
+				/* Higher prio for the queues closer to last stage */
+				q_conf.priority = RTE_EVENT_DEV_PRIORITY_LOWEST -
+								  (step * stage_pos);
+			}
+			opt->lb_queue_ids[num_lb_q++] = queue;
 		}
 		ret = rte_event_queue_setup(opt->dev_id, queue, &q_conf);
 		if (ret) {
@@ -233,6 +246,7 @@ perf_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 			.dequeue_depth = opt->wkr_deq_dep,
 			.enqueue_depth = dev_info.max_event_port_dequeue_depth,
 			.new_event_threshold = dev_info.max_num_events,
+			.event_port_cfg = 0,
 	};
 
 	ret = perf_event_dev_port_setup(test, opt, nb_stages /* stride */,

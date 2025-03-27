@@ -713,7 +713,7 @@ eh_initialize_eventdev(struct eventmode_conf *em_conf)
 
 			/* Set max atomic flows to 1024 */
 			eventq_conf.nb_atomic_flows = 1024;
-			eventq_conf.nb_atomic_order_sequences = 1024;
+			eventq_conf.nb_atomic_order_sequences = 64;
 
 			/* Setup the queue */
 			ret = rte_event_queue_setup(eventdev_id, j,

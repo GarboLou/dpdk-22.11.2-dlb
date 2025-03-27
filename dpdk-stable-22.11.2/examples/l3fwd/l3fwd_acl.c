@@ -247,6 +247,8 @@ struct acl_search_t {
 	int num_ipv6;
 };
 
+#include "l3fwd_acl.h"
+
 static struct {
 	struct rte_acl_ctx *acx_ipv4[NB_SOCKETS];
 	struct rte_acl_ctx *acx_ipv6[NB_SOCKETS];
@@ -262,8 +264,6 @@ static struct rte_acl_rule *acl_base_ipv4, *route_base_ipv4,
 		*acl_base_ipv6, *route_base_ipv6;
 static unsigned int acl_num_ipv4, route_num_ipv4,
 		acl_num_ipv6, route_num_ipv6;
-
-#include "l3fwd_acl.h"
 
 #include "l3fwd_acl_scalar.h"
 
@@ -875,9 +875,9 @@ dump_acl4_rule(struct rte_mbuf *m, uint32_t sig)
 		rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *,
 					sizeof(struct rte_ether_hdr));
 
-	printf("Packet Src:%s ", inet_ntop(AF_INET, ipv4_hdr->src_addr,
+	printf("Packet Src:%s ", inet_ntop(AF_INET, (void*)(uint64_t)ipv4_hdr->src_addr,
 		abuf, sizeof(abuf)));
-	printf("Dst:%s ", inet_ntop(AF_INET, ipv4_hdr->dst_addr,
+	printf("Dst:%s ", inet_ntop(AF_INET, (void*)(uint64_t)ipv4_hdr->dst_addr,
 		abuf, sizeof(abuf)));
 
 	printf("Src port:%hu,Dst port:%hu ",

@@ -531,7 +531,15 @@ int
 eal_plugins_init(void)
 {
 	struct shared_driver *solib = NULL;
+	char *env_solib_dir = NULL;
 	struct stat sb;
+
+	env_solib_dir = getenv("DPDK_ENV_PMD_PATH");
+	if (env_solib_dir != NULL) {
+		RTE_LOG(DEBUG, EAL, "overriding default plugin directory "
+			"path with environment value: %s\n", env_solib_dir);
+		default_solib_dir = env_solib_dir;
+	}
 
 	/* If we are not statically linked, add default driver loading
 	 * path if it exists as a directory.

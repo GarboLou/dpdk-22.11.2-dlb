@@ -6,6 +6,8 @@
 #define __DLB2_RESOURCE_H
 
 #include "dlb2_user.h"
+
+#include "dlb2_hw_types.h"
 #include "dlb2_osdep_types.h"
 
 /**
@@ -37,17 +39,6 @@ int dlb2_resource_init(struct dlb2_hw *hw, enum dlb2_hw_ver ver, const void *pro
  */
 int dlb2_resource_probe(struct dlb2_hw *hw, const void *probe_args);
 
-
-/**
- * dlb2_clr_pmcsr_disable() - power on bulk of DLB 2.0 logic
- * @hw: dlb2_hw handle for a particular device.
- * @ver: device version.
- *
- * Clearing the PMCSR must be done at initialization to make the device fully
- * operational.
- */
-void dlb2_clr_pmcsr_disable(struct dlb2_hw *hw, enum dlb2_hw_ver ver);
-
 /**
  * dlb2_resource_free() - free device state memory
  * @hw: dlb2_hw handle for a particular device.
@@ -71,8 +62,8 @@ void dlb2_resource_reset(struct dlb2_hw *hw);
  * @hw: dlb2_hw handle for a particular device.
  * @args: scheduling domain creation arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function creates a scheduling domain containing the resources specified
  * in args. The individual resources (queues, ports, credits) can be configured
@@ -86,7 +77,7 @@ void dlb2_resource_reset(struct dlb2_hw *hw);
  * assigned a detailed error code from enum dlb2_error. If successful, resp->id
  * contains the domain ID.
  *
- * resp->id contains a virtual ID if vdev_request is true.
+ * resp->id contains a virtual ID if vdev_req is true.
  *
  * Errors:
  * EINVAL - A requested resource is unavailable, or the requested domain name
@@ -96,7 +87,7 @@ void dlb2_resource_reset(struct dlb2_hw *hw);
 int dlb2_hw_create_sched_domain(struct dlb2_hw *hw,
 				struct dlb2_create_sched_domain_args *args,
 				struct dlb2_cmd_response *resp,
-				bool vdev_request,
+				bool vdev_req,
 				unsigned int vdev_id);
 
 /**
@@ -105,8 +96,8 @@ int dlb2_hw_create_sched_domain(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: queue creation arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function creates a load-balanced queue.
  *
@@ -118,7 +109,7 @@ int dlb2_hw_create_sched_domain(struct dlb2_hw *hw,
  * assigned a detailed error code from enum dlb2_error. If successful, resp->id
  * contains the queue ID.
  *
- * resp->id contains a virtual ID if vdev_request is true.
+ * resp->id contains a virtual ID if vdev_req is true.
  *
  * Errors:
  * EINVAL - A requested resource is unavailable, the domain is not configured,
@@ -130,7 +121,7 @@ int dlb2_hw_create_ldb_queue(struct dlb2_hw *hw,
 			     u32 domain_id,
 			     struct dlb2_create_ldb_queue_args *args,
 			     struct dlb2_cmd_response *resp,
-			     bool vdev_request,
+			     bool vdev_req,
 			     unsigned int vdev_id);
 
 /**
@@ -139,8 +130,8 @@ int dlb2_hw_create_ldb_queue(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: queue creation arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function creates a directed queue.
  *
@@ -152,7 +143,7 @@ int dlb2_hw_create_ldb_queue(struct dlb2_hw *hw,
  * assigned a detailed error code from enum dlb2_error. If successful, resp->id
  * contains the queue ID.
  *
- * resp->id contains a virtual ID if vdev_request is true.
+ * resp->id contains a virtual ID if vdev_req is true.
  *
  * Errors:
  * EINVAL - A requested resource is unavailable, the domain is not configured,
@@ -163,7 +154,7 @@ int dlb2_hw_create_dir_queue(struct dlb2_hw *hw,
 			     u32 domain_id,
 			     struct dlb2_create_dir_queue_args *args,
 			     struct dlb2_cmd_response *resp,
-			     bool vdev_request,
+			     bool vdev_req,
 			     unsigned int vdev_id);
 
 /**
@@ -173,8 +164,8 @@ int dlb2_hw_create_dir_queue(struct dlb2_hw *hw,
  * @args: port creation arguments.
  * @cq_dma_base: base address of the CQ memory. This can be a PA or an IOVA.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function creates a directed port.
  *
@@ -186,7 +177,7 @@ int dlb2_hw_create_dir_queue(struct dlb2_hw *hw,
  * assigned a detailed error code from enum dlb2_error. If successful, resp->id
  * contains the port ID.
  *
- * resp->id contains a virtual ID if vdev_request is true.
+ * resp->id contains a virtual ID if vdev_req is true.
  *
  * Errors:
  * EINVAL - A requested resource is unavailable, a credit setting is invalid, a
@@ -199,7 +190,7 @@ int dlb2_hw_create_dir_port(struct dlb2_hw *hw,
 			    struct dlb2_create_dir_port_args *args,
 			    uintptr_t cq_dma_base,
 			    struct dlb2_cmd_response *resp,
-			    bool vdev_request,
+			    bool vdev_req,
 			    unsigned int vdev_id);
 
 /**
@@ -209,8 +200,8 @@ int dlb2_hw_create_dir_port(struct dlb2_hw *hw,
  * @args: port creation arguments.
  * @cq_dma_base: base address of the CQ memory. This can be a PA or an IOVA.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function creates a load-balanced port.
  *
@@ -222,7 +213,7 @@ int dlb2_hw_create_dir_port(struct dlb2_hw *hw,
  * assigned a detailed error code from enum dlb2_error. If successful, resp->id
  * contains the port ID.
  *
- * resp->id contains a virtual ID if vdev_request is true.
+ * resp->id contains a virtual ID if vdev_req is true.
  *
  * Errors:
  * EINVAL - A requested resource is unavailable, a credit setting is invalid, a
@@ -235,7 +226,7 @@ int dlb2_hw_create_ldb_port(struct dlb2_hw *hw,
 			    struct dlb2_create_ldb_port_args *args,
 			    uintptr_t cq_dma_base,
 			    struct dlb2_cmd_response *resp,
-			    bool vdev_request,
+			    bool vdev_req,
 			    unsigned int vdev_id);
 
 /**
@@ -244,8 +235,8 @@ int dlb2_hw_create_ldb_port(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: start domain arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function starts a scheduling domain, which allows applications to send
  * traffic through it. Once a domain is started, its resources can no longer be
@@ -265,7 +256,36 @@ int dlb2_hw_start_domain(struct dlb2_hw *hw,
 			 u32 domain_id,
 			 struct dlb2_start_domain_args *args,
 			 struct dlb2_cmd_response *resp,
-			 bool vdev_request,
+			 bool vdev_req,
+			 unsigned int vdev_id);
+
+/**
+ * dlb2_hw_stop_domain() - stop a scheduling domain
+ * @hw: dlb2_hw handle for a particular device.
+ * @domain_id: domain ID.
+ * @args: stop domain arguments.
+ * @resp: response structure.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
+ *
+ * This function stops a scheduling domain. When stopped applications can no 
+ * longer send traffic through it.
+ *
+ * A vdev can be either an SR-IOV virtual function or a Scalable IOV virtual
+ * device.
+ *
+ * Return:
+ * Returns 0 upon success, < 0 otherwise. If an error occurs, resp->status is
+ * assigned a detailed error code from enum dlb2_error.
+ *
+ * Errors:
+ * EINVAL - the domain is not configured, or the domain is already stopped.
+ */
+int dlb2_hw_stop_domain(struct dlb2_hw *hw,
+			 u32 domain_id,
+			 struct dlb2_stop_domain_args *args,
+			 struct dlb2_cmd_response *resp,
+			 bool vdev_req,
 			 unsigned int vdev_id);
 
 /**
@@ -274,8 +294,8 @@ int dlb2_hw_start_domain(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: map QID arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function configures the DLB to schedule QEs from the specified queue
  * to the specified port. Each load-balanced port can be mapped to up to 8
@@ -313,7 +333,7 @@ int dlb2_hw_map_qid(struct dlb2_hw *hw,
 		    u32 domain_id,
 		    struct dlb2_map_qid_args *args,
 		    struct dlb2_cmd_response *resp,
-		    bool vdev_request,
+		    bool vdev_req,
 		    unsigned int vdev_id);
 
 /**
@@ -322,8 +342,8 @@ int dlb2_hw_map_qid(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: unmap QID arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function configures the DLB to stop scheduling QEs from the specified
  * queue to the specified port.
@@ -351,7 +371,7 @@ int dlb2_hw_unmap_qid(struct dlb2_hw *hw,
 		      u32 domain_id,
 		      struct dlb2_unmap_qid_args *args,
 		      struct dlb2_cmd_response *resp,
-		      bool vdev_request,
+		      bool vdev_req,
 		      unsigned int vdev_id);
 
 /**
@@ -386,8 +406,8 @@ unsigned int dlb2_finish_map_qid_procedures(struct dlb2_hw *hw);
  * @domain_id: domain ID.
  * @args: port enable arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function configures the DLB to schedule QEs to a load-balanced port.
  * Ports are enabled by default.
@@ -407,7 +427,7 @@ int dlb2_hw_enable_ldb_port(struct dlb2_hw *hw,
 			    u32 domain_id,
 			    struct dlb2_enable_ldb_port_args *args,
 			    struct dlb2_cmd_response *resp,
-			    bool vdev_request,
+			    bool vdev_req,
 			    unsigned int vdev_id);
 
 /**
@@ -416,8 +436,8 @@ int dlb2_hw_enable_ldb_port(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: port disable arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function configures the DLB to stop scheduling QEs to a load-balanced
  * port. Ports are enabled by default.
@@ -437,7 +457,7 @@ int dlb2_hw_disable_ldb_port(struct dlb2_hw *hw,
 			     u32 domain_id,
 			     struct dlb2_disable_ldb_port_args *args,
 			     struct dlb2_cmd_response *resp,
-			     bool vdev_request,
+			     bool vdev_req,
 			     unsigned int vdev_id);
 
 /**
@@ -446,8 +466,8 @@ int dlb2_hw_disable_ldb_port(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: port enable arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function configures the DLB to schedule QEs to a directed port.
  * Ports are enabled by default.
@@ -467,7 +487,7 @@ int dlb2_hw_enable_dir_port(struct dlb2_hw *hw,
 			    u32 domain_id,
 			    struct dlb2_enable_dir_port_args *args,
 			    struct dlb2_cmd_response *resp,
-			    bool vdev_request,
+			    bool vdev_req,
 			    unsigned int vdev_id);
 
 /**
@@ -476,8 +496,8 @@ int dlb2_hw_enable_dir_port(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: port disable arguments.
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function configures the DLB to stop scheduling QEs to a directed port.
  * Ports are enabled by default.
@@ -497,7 +517,7 @@ int dlb2_hw_disable_dir_port(struct dlb2_hw *hw,
 			     u32 domain_id,
 			     struct dlb2_disable_dir_port_args *args,
 			     struct dlb2_cmd_response *resp,
-			     bool vdev_request,
+			     bool vdev_req,
 			     unsigned int vdev_id);
 
 /**
@@ -600,8 +620,8 @@ void dlb2_ack_msix_interrupt(struct dlb2_hw *hw, int vector);
  * @hw: dlb2_hw handle for a particular device.
  * @port_id: port ID
  * @is_ldb: true for load-balanced port, false for a directed port
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function arms the CQ's interrupt. The CQ must be configured prior to
  * calling this function.
@@ -619,7 +639,7 @@ void dlb2_ack_msix_interrupt(struct dlb2_hw *hw, int vector);
 int dlb2_arm_cq_interrupt(struct dlb2_hw *hw,
 			  int port_id,
 			  bool is_ldb,
-			  bool vdev_request,
+			  bool vdev_req,
 			  unsigned int vdev_id);
 
 /**
@@ -809,7 +829,7 @@ bool dlb2_process_ingress_error_interrupt(struct dlb2_hw *hw);
  * Returns -EINVAL if group_id is invalid, else the group's SNs per queue.
  */
 int dlb2_get_group_sequence_numbers(struct dlb2_hw *hw,
-				    unsigned int group_id);
+				    u32 group_id);
 
 /**
  * dlb2_get_group_sequence_number_occupancy() - return a group's in-use slots
@@ -823,7 +843,7 @@ int dlb2_get_group_sequence_numbers(struct dlb2_hw *hw,
  * Returns -EINVAL if group_id is invalid, else the group's SNs per queue.
  */
 int dlb2_get_group_sequence_number_occupancy(struct dlb2_hw *hw,
-					     unsigned int group_id);
+					     u32 group_id);
 
 /**
  * dlb2_set_group_sequence_numbers() - assign a group's number of SNs per queue
@@ -848,8 +868,8 @@ int dlb2_set_group_sequence_numbers(struct dlb2_hw *hw,
  * dlb2_reset_domain() - reset a scheduling domain
  * @hw: dlb2_hw handle for a particular device.
  * @domain_id: domain ID.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function resets and frees a DLB 2.0 scheduling domain and its associated
  * resources.
@@ -871,7 +891,7 @@ int dlb2_set_group_sequence_numbers(struct dlb2_hw *hw,
  */
 int dlb2_reset_domain(struct dlb2_hw *hw,
 		      u32 domain_id,
-		      bool vdev_request,
+		      bool vdev_req,
 		      unsigned int vdev_id);
 
 /**
@@ -879,8 +899,8 @@ int dlb2_reset_domain(struct dlb2_hw *hw,
  * @hw: dlb2_hw handle for a particular device.
  * @domain_id: domain ID.
  * @port_id: indicates whether this request came from a VF.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function returns whether a load-balanced port is owned by a specified
  * domain.
@@ -896,7 +916,7 @@ int dlb2_reset_domain(struct dlb2_hw *hw,
 int dlb2_ldb_port_owned_by_domain(struct dlb2_hw *hw,
 				  u32 domain_id,
 				  u32 port_id,
-				  bool vdev_request,
+				  bool vdev_req,
 				  unsigned int vdev_id);
 
 /**
@@ -904,8 +924,8 @@ int dlb2_ldb_port_owned_by_domain(struct dlb2_hw *hw,
  * @hw: dlb2_hw handle for a particular device.
  * @domain_id: domain ID.
  * @port_id: indicates whether this request came from a VF.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function returns whether a directed port is owned by a specified
  * domain.
@@ -921,15 +941,15 @@ int dlb2_ldb_port_owned_by_domain(struct dlb2_hw *hw,
 int dlb2_dir_port_owned_by_domain(struct dlb2_hw *hw,
 				  u32 domain_id,
 				  u32 port_id,
-				  bool vdev_request,
+				  bool vdev_req,
 				  unsigned int vdev_id);
 
 /**
  * dlb2_hw_get_num_resources() - query the PCI function's available resources
  * @hw: dlb2_hw handle for a particular device.
  * @arg: pointer to resource counts.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function returns the number of available resources for the PF or for a
  * VF.
@@ -938,20 +958,20 @@ int dlb2_dir_port_owned_by_domain(struct dlb2_hw *hw,
  * device.
  *
  * Return:
- * Returns 0 upon success, -EINVAL if vdev_request is true and vdev_id is
+ * Returns 0 upon success, -EINVAL if vdev_req is true and vdev_id is
  * invalid.
  */
 int dlb2_hw_get_num_resources(struct dlb2_hw *hw,
 			      struct dlb2_get_num_resources_args *arg,
-			      bool vdev_request,
+			      bool vdev_req,
 			      unsigned int vdev_id);
 
 /**
  * dlb2_hw_get_num_used_resources() - query the PCI function's used resources
  * @hw: dlb2_hw handle for a particular device.
  * @arg: pointer to resource counts.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function returns the number of resources in use by the PF or a VF. It
  * fills in the fields that args points to, except the following:
@@ -964,12 +984,12 @@ int dlb2_hw_get_num_resources(struct dlb2_hw *hw,
  * device.
  *
  * Return:
- * Returns 0 upon success, -EINVAL if vdev_request is true and vdev_id is
+ * Returns 0 upon success, -EINVAL if vdev_req is true and vdev_id is
  * invalid.
  */
 int dlb2_hw_get_num_used_resources(struct dlb2_hw *hw,
 				   struct dlb2_get_num_resources_args *arg,
-				   bool vdev_request,
+				   bool vdev_req,
 				   unsigned int vdev_id);
 
 /**
@@ -1407,6 +1427,30 @@ int dlb2_update_vdev_ldb_credits(struct dlb2_hw *hw, u32 id, u32 num);
 int dlb2_update_vdev_dir_credits(struct dlb2_hw *hw, u32 id, u32 num);
 
 /**
+ * dlb2_update_vdev_credits() - update the vdev's assigned credits
+ * @hw: dlb2_hw handle for a particular device.
+ * @id: virtual device ID
+ * @num: number of credits to assign to this vdev
+ *
+ * This function assigns num credits to the specified vdev. If the vdev
+ * already has credits assigned, this existing assignment is adjusted
+ * accordingly. vdevs are assigned a contiguous chunk of credits, so this
+ * function may fail if a sufficiently large contiguous chunk is not available.
+ *
+ * A vdev can be either an SR-IOV virtual function or a Scalable IOV virtual
+ * device.
+ *
+ * Return:
+ * Returns 0 upon success, <0 otherwise.
+ *
+ * Errors:
+ * EINVAL - id is invalid, or the requested number of resources are
+ *	    unavailable.
+ * EPERM  - The vdev's resource assignment is locked and cannot be changed.
+ */
+int dlb2_update_vdev_credits(struct dlb2_hw *hw, u32 id, u32 num);
+
+/**
  * dlb2_update_vdev_hist_list_entries() - update the vdev's assigned HL entries
  * @hw: dlb2_hw handle for a particular device.
  * @id: virtual device ID
@@ -1508,13 +1552,23 @@ int dlb2_notify_vf(struct dlb2_hw *hw,
 int dlb2_vdev_in_use(struct dlb2_hw *hw, unsigned int id);
 
 /**
+ * dlb2_clr_pmcsr_disable() - power on bulk of DLB 2.0 logic
+ * @hw: dlb2_hw handle for a particular device.
+ * @ver: device version.
+ *
+ * Clearing the PMCSR must be done at initialization to make the device fully
+ * operational.
+ */
+void dlb2_clr_pmcsr_disable(struct dlb2_hw *hw, enum dlb2_hw_ver ver);
+
+/**
  * dlb2_hw_get_ldb_queue_depth() - returns the depth of a load-balanced queue
  * @hw: dlb2_hw handle for a particular device.
  * @domain_id: domain ID.
  * @args: queue depth args
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function returns the depth of a load-balanced queue.
  *
@@ -1533,7 +1587,7 @@ int dlb2_hw_get_ldb_queue_depth(struct dlb2_hw *hw,
 				u32 domain_id,
 				struct dlb2_get_ldb_queue_depth_args *args,
 				struct dlb2_cmd_response *resp,
-				bool vdev_request,
+				bool vdev_req,
 				unsigned int vdev_id);
 
 /**
@@ -1542,8 +1596,8 @@ int dlb2_hw_get_ldb_queue_depth(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: queue depth args
  * @resp: response structure.
- * @vdev_request: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_req: indicates whether this request came from a vdev.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * This function returns the depth of a directed queue.
  *
@@ -1562,7 +1616,7 @@ int dlb2_hw_get_dir_queue_depth(struct dlb2_hw *hw,
 				u32 domain_id,
 				struct dlb2_get_dir_queue_depth_args *args,
 				struct dlb2_cmd_response *resp,
-				bool vdev_request,
+				bool vdev_req,
 				unsigned int vdev_id);
 
 enum dlb2_virt_mode {
@@ -1666,6 +1720,7 @@ void dlb2_hw_unregister_sw_mbox(struct dlb2_hw *hw, unsigned int vdev_id);
  * @vdev_id: vdev ID.
  * @virt_cq_id: virtual CQ ID.
  * @is_ldb: CQ is load-balanced.
+ * @addr_hi: most-significant 32 bits of address.
  * @addr_lo: least-significant 32 bits of address.
  * @data: 32 data bits.
  *
@@ -1678,6 +1733,7 @@ void dlb2_hw_setup_cq_ims_entry(struct dlb2_hw *hw,
 				unsigned int vdev_id,
 				u32 virt_cq_id,
 				bool is_ldb,
+				u32 addr_hi,
 				u32 addr_lo,
 				u32 data);
 
@@ -1718,8 +1774,8 @@ int dlb2_hw_register_pasid(struct dlb2_hw *hw,
  * @domain_id: domain ID.
  * @args: number of unmaps in progress args
  * @resp: response structure.
- * @vf_request: indicates whether this request came from a VF.
- * @vf_id: If vf_request is true, this contains the VF's ID.
+ * @vdev_request: indicates whether this request came from a VDEV.
+ * @vdev_id: If vdev_request is true, this contains the VDEV's ID.
  *
  * Return:
  * Returns 0 upon success, < 0 otherwise. If an error occurs, resp->status is
@@ -1733,8 +1789,8 @@ int dlb2_hw_pending_port_unmaps(struct dlb2_hw *hw,
 				u32 domain_id,
 				struct dlb2_pending_port_unmaps_args *args,
 				struct dlb2_cmd_response *resp,
-				bool vf_request,
-				unsigned int vf_id);
+				bool vdev_request,
+				unsigned int vdev_id);
 
 /**
  * dlb2_hw_get_cos_bandwidth() - returns the percent of bandwidth allocated
@@ -1800,7 +1856,7 @@ int dlb2_hw_enable_wd_timer(struct dlb2_hw *hw, enum dlb2_wd_tmo tmo);
  * @hw: dlb2_hw handle for a particular device.
  * @id: port ID.
  * @vdev_req: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * Return:
  * Returns 0 upon success, < 0 otherwise.
@@ -1819,7 +1875,7 @@ int dlb2_hw_enable_dir_cq_wd_int(struct dlb2_hw *hw,
  * @hw: dlb2_hw handle for a particular device.
  * @id: port ID.
  * @vdev_req: indicates whether this request came from a vdev.
- * @vdev_id: If vdev_request is true, this contains the vdev's ID.
+ * @vdev_id: If vdev_req is true, this contains the vdev's ID.
  *
  * Return:
  * Returns 0 upon success, < 0 otherwise.
@@ -1848,6 +1904,20 @@ void dlb2_hw_enable_sparse_ldb_cq_mode(struct dlb2_hw *hw);
  * This function must be called prior to configuring scheduling domains.
  */
 void dlb2_hw_enable_sparse_dir_cq_mode(struct dlb2_hw *hw);
+
+/**
+ * dlb2_hw_enable_ldb_sched_perf_ctrl() - enable scheduling idle perf counters.
+ * @hw: dlb2_hw handle for a particular device.
+ *
+ */
+void dlb2_hw_enable_ldb_sched_perf_ctrl(struct dlb2_hw *hw);
+
+/**
+ * dlb2_hw_disable_ldb_sched_perf_ctrl() - clear scheduling idle perf counters.
+ * @hw: dlb2_hw handle for a particular device.
+ *
+ */
+void dlb2_hw_disable_ldb_sched_perf_ctrl(struct dlb2_hw *hw);
 
 /**
  * dlb2_hw_set_qe_arbiter_weights() - program QE arbiter weights
@@ -1924,7 +1994,7 @@ void dlb2_hw_dir_cq_interrupt_set_mode(struct dlb2_hw *hw,
 				       int mode);
 
 /**
- * dlb2_hw_enable_cq_weight() - Enable QE-weight based scheduling on an LDB port.
+ * dlb2_enable_cq_weight() - Enable QE-weight based scheduling on an LDB port.
  * @hw: dlb2_hw handle for a particular device.
  * @domain_id: domain ID.
  * @args: CQ weight enablement arguments.
@@ -1945,15 +2015,51 @@ void dlb2_hw_dir_cq_interrupt_set_mode(struct dlb2_hw *hw,
  *
  * Errors:
  * EINVAL - The domain or port is not configured, the domainhas already been
- *          started, the requested limit exceeds the port's CQ depth, or this
- *          feature is unavailable on the device.
+ *	    started, the requested limit exceeds the port's CQ depth, or this
+ *	    feature is unavailable on the device.
  * EFAULT - Internal error (resp->status not set).
  */
 int dlb2_hw_enable_cq_weight(struct dlb2_hw *hw,
-			     u32 domain_id,
-			     struct dlb2_enable_cq_weight_args *args,
-			     struct dlb2_cmd_response *resp,
-			     bool vdev_request,
-			     unsigned int vdev_id);
+			  u32 domain_id,
+			  struct dlb2_enable_cq_weight_args *args,
+			  struct dlb2_cmd_response *resp,
+			  bool vdev_request,
+			  unsigned int vdev_id);
+/**
+ * This function configures the inflight control threshold for a cq.
+ *
+ * This must be called after creating the port.
+ *
+ * Return:
+ * Returns 0 upon success, < 0 otherwise. If an error occurs, resp->status is
+ * assigned a detailed error code from enum dlb2_error. If successful, resp->id
+ * contains the queue ID.
+ *
+ * Errors:
+ * EINVAL - The domain or port is not configured.
+ */
+int dlb2_hw_set_cq_inflight_ctrl(struct dlb2_hw *hw, u32 domain_id,
+                                 struct dlb2_cq_inflight_ctrl_args *args,
+                                 struct dlb2_cmd_response *resp,
+                                 bool vdev_request, unsigned int vdev_id);
+
+/**
+ * dlb2_read_sched_idle_counts() - read idle perf counter registers.
+ * @hw: dlb2_hw handle for a particular device.
+ * @data: dlb2_hw_sched_idle_counts idle counters structure.
+ *
+ * Return:
+ * Returns 0 upon success, < 0 otherwise.
+ */
+int dlb2_read_sched_idle_counts(struct dlb2_hw *hw,
+				struct dlb2_hw_sched_idle_counts *data);
+
+/**
+ * dlb2_hw_set_rate_limit() - rate limit total throughput.
+ * @hw: dlb2_hw handle for a particular device.
+ * @rate_limit: write buffer schedule rate limit.
+ *
+ */
+void dlb2_hw_set_rate_limit(struct dlb2_hw *hw, int rate_limit);
 
 #endif /* __DLB2_RESOURCE_H */

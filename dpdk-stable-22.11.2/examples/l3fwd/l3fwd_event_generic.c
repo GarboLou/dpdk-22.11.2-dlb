@@ -8,7 +8,7 @@
 #include "l3fwd_event.h"
 
 static uint32_t
-l3fwd_event_device_setup_generic(void)
+l3fwd_event_device_setup_generic(bool strict_single_link)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	struct rte_event_dev_config event_d_conf = {
@@ -24,6 +24,9 @@ l3fwd_event_device_setup_generic(void)
 	uint16_t num_workers = 0;
 	uint16_t port_id;
 	int ret;
+
+	if (strict_single_link)
+		event_d_conf.nb_single_link_event_port_queues = 1;
 
 	RTE_ETH_FOREACH_DEV(port_id) {
 		if ((evt_rsrc->port_mask & (1 << port_id)) == 0)
@@ -42,6 +45,7 @@ l3fwd_event_device_setup_generic(void)
 
 	/* One queue for each ethdev port + one Tx adapter Single link queue. */
 	event_d_conf.nb_event_queues = ethdev_count + 1;
+
 	if (dev_info.max_event_queues < event_d_conf.nb_event_queues)
 		event_d_conf.nb_event_queues = dev_info.max_event_queues;
 
@@ -68,7 +72,13 @@ l3fwd_event_device_setup_generic(void)
 
 	event_d_conf.nb_event_ports = num_workers;
 	evt_rsrc->evp.nb_ports = num_workers;
+
 	evt_rsrc->evq.nb_queues = event_d_conf.nb_event_queues;
+
+	if (strict_single_link) {
+		event_d_conf.nb_event_ports++;
+		evt_rsrc->evp.nb_ports++;
+	}
 
 	evt_rsrc->has_burst = !!(dev_info.event_dev_cap &
 				    RTE_EVENT_DEV_CAP_BURST_MODE);
@@ -82,7 +92,7 @@ l3fwd_event_device_setup_generic(void)
 }
 
 static void
-l3fwd_event_port_setup_generic(void)
+l3fwd_event_port_setup_generic(bool strict_single_link)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	uint8_t event_d_id = evt_rsrc->event_d_id;
@@ -94,6 +104,9 @@ l3fwd_event_port_setup_generic(void)
 	struct rte_event_port_conf def_p_conf;
 	uint8_t event_p_id;
 	int32_t ret;
+	uint8_t effective_ports = strict_single_link ?
+					evt_rsrc->evp.nb_ports - 1 :
+					evt_rsrc->evp.nb_ports;
 
 	evt_rsrc->evp.event_p_id = (uint8_t *)malloc(sizeof(uint8_t) *
 					evt_rsrc->evp.nb_ports);
@@ -122,8 +135,7 @@ l3fwd_event_port_setup_generic(void)
 
 	evt_rsrc->deq_depth = def_p_conf.dequeue_depth;
 
-	for (event_p_id = 0; event_p_id < evt_rsrc->evp.nb_ports;
-								event_p_id++) {
+	for (event_p_id = 0; event_p_id < effective_ports; event_p_id++) {
 		ret = rte_event_port_setup(event_d_id, event_p_id,
 					   &event_p_conf);
 		if (ret < 0)
@@ -139,20 +151,21 @@ l3fwd_event_port_setup_generic(void)
 				  event_p_id);
 		evt_rsrc->evp.event_p_id[event_p_id] = event_p_id;
 	}
+
 	/* init spinlock */
 	rte_spinlock_init(&evt_rsrc->evp.lock);
 
 	evt_rsrc->def_p_conf = event_p_conf;
 }
 
-static void
+static int
 l3fwd_event_queue_setup_generic(uint32_t event_queue_cfg)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	uint8_t event_d_id = evt_rsrc->event_d_id;
 	struct rte_event_queue_conf event_q_conf = {
 		.nb_atomic_flows = 1024,
-		.nb_atomic_order_sequences = 1024,
+		.nb_atomic_order_sequences = 64,
 		.event_queue_cfg = event_queue_cfg,
 		.priority = RTE_EVENT_DEV_PRIORITY_NORMAL
 	};
@@ -183,15 +196,17 @@ l3fwd_event_queue_setup_generic(uint32_t event_queue_cfg)
 	}
 
 	event_q_conf.event_queue_cfg |= RTE_EVENT_QUEUE_CFG_SINGLE_LINK;
-	event_q_conf.priority = RTE_EVENT_DEV_PRIORITY_HIGHEST,
+	event_q_conf.priority = RTE_EVENT_DEV_PRIORITY_HIGHEST;
 	ret = rte_event_queue_setup(event_d_id, event_q_id, &event_q_conf);
 	if (ret < 0)
-		rte_panic("Error in configuring event queue for Tx adapter\n");
+		return ret;
+
 	evt_rsrc->evq.event_q_id[event_q_id] = event_q_id;
+	return 0;
 }
 
 static void
-l3fwd_rx_tx_adapter_setup_generic(void)
+l3fwd_rx_tx_adapter_setup_generic(bool strict_single_link)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	struct rte_event_eth_rx_adapter_queue_conf eth_q_conf;
@@ -259,9 +274,12 @@ l3fwd_rx_tx_adapter_setup_generic(void)
 		free(evt_rsrc->evq.event_q_id);
 		rte_panic("Failed to allocate memory for Rx adapter\n");
 	}
+	if (strict_single_link)
+		evt_rsrc->def_p_conf.event_port_cfg |= RTE_EVENT_PORT_CFG_SINGLE_LINK;
 
 	ret = rte_event_eth_tx_adapter_create(tx_adptr_id, event_d_id,
 					      &evt_rsrc->def_p_conf);
+
 	if (ret)
 		rte_panic("Failed to create tx adapter\n");
 

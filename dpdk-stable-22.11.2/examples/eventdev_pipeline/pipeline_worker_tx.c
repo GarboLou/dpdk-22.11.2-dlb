@@ -479,7 +479,7 @@ setup_eventdev_worker_tx_enq(struct worker_data *worker_data)
 			.schedule_type = cdata.queue_type,
 			.priority = RTE_EVENT_DEV_PRIORITY_NORMAL,
 			.nb_atomic_flows = 1024,
-			.nb_atomic_order_sequences = 1024,
+			.nb_atomic_order_sequences = 64,
 	};
 
 	int ret, ndev = rte_event_dev_count();

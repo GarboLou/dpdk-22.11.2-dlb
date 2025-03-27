@@ -150,7 +150,7 @@ l2fwd_event_port_setup_internal_port(struct l2fwd_resources *rsrc)
 	evt_rsrc->def_p_conf = event_p_conf;
 }
 
-static void
+static int
 l2fwd_event_queue_setup_internal_port(struct l2fwd_resources *rsrc,
 				uint32_t event_queue_cfg)
 {
@@ -158,7 +158,7 @@ l2fwd_event_queue_setup_internal_port(struct l2fwd_resources *rsrc,
 	uint8_t event_d_id = evt_rsrc->event_d_id;
 	struct rte_event_queue_conf event_q_conf = {
 		.nb_atomic_flows = 1024,
-		.nb_atomic_order_sequences = 1024,
+		.nb_atomic_order_sequences = 64,
 		.event_queue_cfg = event_queue_cfg,
 		.priority = RTE_EVENT_DEV_PRIORITY_NORMAL
 	};
@@ -194,6 +194,7 @@ l2fwd_event_queue_setup_internal_port(struct l2fwd_resources *rsrc,
 			rte_panic("Error in configuring event queue\n");
 		evt_rsrc->evq.event_q_id[event_q_id] = event_q_id;
 	}
+	return 0;
 }
 
 static void

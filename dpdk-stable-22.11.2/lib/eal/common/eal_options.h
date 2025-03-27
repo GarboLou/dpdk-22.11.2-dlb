@@ -108,5 +108,7 @@ int eal_plugins_init(void);
 int eal_save_args(int argc, char **argv);
 int handle_eal_info_request(const char *cmd, const char *params __rte_unused,
 		struct rte_tel_data *d);
+int
+eal_parse_coremask(const char *coremask, int *cores);
 
 #endif /* EAL_OPTIONS_H */

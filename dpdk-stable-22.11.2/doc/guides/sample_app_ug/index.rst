@@ -55,3 +55,4 @@ Sample Applications User Guides
     ipsec_secgw
     bbdev_app
     ntb
+    eventdev_cpu_loopback

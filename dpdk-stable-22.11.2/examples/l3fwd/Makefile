@@ -22,12 +22,18 @@ shared: build/$(APP)-shared
 static: build/$(APP)-static
 	ln -sf $(APP)-static build/$(APP)
 
+ifneq ($(wildcard $(RTE_SDK)),)
+	ifneq ($(RTE_TARGET),)
+		PKGCONF_OPTS := --define-variable=prefix=$(RTE_SDK)/$(RTE_TARGET)
+	endif
+endif
+
 PC_FILE := $(shell $(PKGCONF) --path libdpdk 2>/dev/null)
-CFLAGS += -O3 $(shell $(PKGCONF) --cflags libdpdk)
+CFLAGS += -O3 $(shell $(PKGCONF) $(PKGCONF_OPTS) --cflags libdpdk)
 # Added for 'rte_eth_link_to_str()'
 CFLAGS += -DALLOW_EXPERIMENTAL_API
-LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk)
-LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk)
+LDFLAGS_SHARED = $(shell $(PKGCONF) $(PKGCONF_OPTS) --libs libdpdk)
+LDFLAGS_STATIC = $(shell $(PKGCONF) $(PKGCONF_OPTS) --static --libs libdpdk)
 
 ifeq ($(MAKECMDGOALS),static)
 # check for broken pkg-config

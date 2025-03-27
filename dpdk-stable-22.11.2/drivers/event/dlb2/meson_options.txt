@@ -1,0 +1,10 @@
+
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(c) 2023-2024 Intel Corporation
+# WARNING: Do not change defaults without knowing the side effects
+
+DLB2_BYPASS_FENCE_ON_PP = 0
+DLB_HW_CREDITS_CHECKS = 0
+DLB_SW_CREDITS_CHECKS = 1
+DLB_TYPE_CHECK = 1
+

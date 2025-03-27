@@ -11,6 +11,8 @@ if enable_apps.length() == 0
 endif
 
 apps = [
+	'dlb_monitor',
+	'eventdev_dump',
         'dumpcap',
         'pdump',
         'proc-info',

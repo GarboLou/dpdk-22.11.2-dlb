@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2016-2022 Intel Corporation
+ * Copyright(c) 2016-2023 Intel Corporation
  */
 
 #include <assert.h>
@@ -17,7 +17,7 @@
 #include <rte_config.h>
 #include <rte_cycles.h>
 #include <rte_debug.h>
-#include <dev_driver.h>
+#include <rte_dev.h>
 #include <rte_errno.h>
 #include <rte_eventdev.h>
 #include <eventdev_pmd.h>
@@ -30,10 +30,12 @@
 #include <rte_prefetch.h>
 #include <rte_ring.h>
 #include <rte_string_fns.h>
+#include <dirent.h>
 
 #include "dlb2_priv.h"
 #include "dlb2_iface.h"
 #include "dlb2_inline_fns.h"
+#include "bifurcated/dlb2_vdev.h"
 
 /*
  * Bypass memory fencing instructions when port is of Producer type.
@@ -43,7 +45,60 @@
  * to DLB can go ahead of relevant application writes like updates to buffers
  * being sent with event
  */
+#ifndef DLB2_BYPASS_FENCE_ON_PP
 #define DLB2_BYPASS_FENCE_ON_PP 0  /* 1 == Bypass fence, 0 == do not bypass */
+#endif
+/*
+ * Optimization switches for improving driver performance.
+ * WARNING: Do not change any of the below switches without first
+ * consulting with DLB2 software development team.
+ *
+ * HW credit checks can only be turned off for DLB2 device if following
+ * is true for each created eventdev
+ * LDB credits <= DIR credits + minimum CQ Depth
+ * (CQ Depth is minimum of all ports configured within eventdev)
+ * This needs to be true for all eventdevs created on any DLB2 device
+ * managed by this driver.
+ * DLB2.5 does not any such restriction as it has single credit pool
+ */
+#ifndef DLB_HW_CREDITS_CHECKS
+#define DLB_HW_CREDITS_CHECKS 1
+#endif
+
+/*
+ * SW credit checks can only be turned off if application has a way to
+ * limit input events to the eventdev below assigned credit limit
+ */
+#ifndef DLB_SW_CREDITS_CHECKS
+#define DLB_SW_CREDITS_CHECKS 1
+#endif
+
+/*
+ * Once application is fully validated, type check can be turned off.
+ * HW will continue checking for correct type and generate alarm on mismatch
+ */
+#ifndef DLB_TYPE_CHECK
+#define DLB_TYPE_CHECK 1
+#endif
+#define DLB_TYPE_MACRO 0x010002
+
+/*
+ * To avoid deadlock situations, by default, per port new_event_threshold
+ * check is disabled. nb_events_limit is still checked while allocating
+ * new event credits.
+ */
+#define ENABLE_PORT_THRES_CHECK 1
+/*
+ * To avoid deadlock, ports holding to credits will release them after these
+ * many consecutive zero dequeues
+ */
+#define DLB2_ZERO_DEQ_CREDIT_RETURN_THRES 16384
+
+/*
+ * To avoid deadlock, ports holding to credits will release them after these
+ * many consecutive enqueue failures
+ */
+#define DLB2_ENQ_FAIL_CREDIT_RETURN_THRES 100
 
 /*
  * Resources exposed to eventdev. Some values overridden at runtime using
@@ -52,46 +107,36 @@
 #if (RTE_EVENT_MAX_QUEUES_PER_DEV > UINT8_MAX)
 #error "RTE_EVENT_MAX_QUEUES_PER_DEV cannot fit in member max_event_queues"
 #endif
-static struct rte_event_dev_info evdev_dlb2_default_info = {
-	.driver_name = "", /* probe will set */
-	.min_dequeue_timeout_ns = DLB2_MIN_DEQUEUE_TIMEOUT_NS,
-	.max_dequeue_timeout_ns = DLB2_MAX_DEQUEUE_TIMEOUT_NS,
-#if (RTE_EVENT_MAX_QUEUES_PER_DEV < DLB2_MAX_NUM_LDB_QUEUES)
-	.max_event_queues = RTE_EVENT_MAX_QUEUES_PER_DEV,
-#else
-	.max_event_queues = DLB2_MAX_NUM_LDB_QUEUES,
-#endif
-	.max_event_queue_flows = DLB2_MAX_NUM_FLOWS,
-	.max_event_queue_priority_levels = DLB2_QID_PRIORITIES,
-	.max_event_priority_levels = DLB2_QID_PRIORITIES,
-	.max_event_ports = DLB2_MAX_NUM_LDB_PORTS,
-	.max_event_port_dequeue_depth = DLB2_DEFAULT_CQ_DEPTH,
-	.max_event_port_enqueue_depth = DLB2_MAX_ENQUEUE_DEPTH,
-	.max_event_port_links = DLB2_MAX_NUM_QIDS_PER_LDB_CQ,
-	.max_num_events = DLB2_MAX_NUM_LDB_CREDITS,
-	.max_single_link_event_port_queue_pairs =
-		DLB2_MAX_NUM_DIR_PORTS(DLB2_HW_V2),
-	.event_dev_cap = (RTE_EVENT_DEV_CAP_EVENT_QOS |
-			  RTE_EVENT_DEV_CAP_DISTRIBUTED_SCHED |
-			  RTE_EVENT_DEV_CAP_QUEUE_ALL_TYPES |
-			  RTE_EVENT_DEV_CAP_BURST_MODE |
-			  RTE_EVENT_DEV_CAP_IMPLICIT_RELEASE_DISABLE |
-			  RTE_EVENT_DEV_CAP_RUNTIME_PORT_LINK |
-			  RTE_EVENT_DEV_CAP_MULTIPLE_QUEUE_PORT |
-			  RTE_EVENT_DEV_CAP_MAINTENANCE_FREE),
-};
 
+/*
+ * Use dlb2_movdir64b_single() for token return in
+ * dlb2_consume_qe_immediate(struct dlb2_port *qm_port, int num)
+ */
+#define USE_MOVDIR64B_SINGLE 1
+
+
+/* These functions will vary based on processor capabilities */
+static struct dlb2_port_low_level_io_functions qm_mmio_fns;
+
+/* Contains process-local mapped hardware I/O addresses */
 struct process_local_port_data
-dlb2_port[DLB2_MAX_NUM_PORTS_ALL][DLB2_NUM_PORT_TYPES];
+dlb2_port[RTE_EVENT_MAX_DEVS][DLB2_MAX_NUM_PORTS_ALL][DLB2_NUM_PORT_TYPES];
 
 static void
 dlb2_free_qe_mem(struct dlb2_port *qm_port)
 {
+	const struct rte_memzone *mz;
+
 	if (qm_port == NULL)
 		return;
 
 	rte_free(qm_port->qe4);
 	qm_port->qe4 = NULL;
+
+	if (qm_port->order) {
+		rte_free(qm_port->order);
+		qm_port->order = NULL;
+	}
 
 	rte_free(qm_port->int_arm_qe);
 	qm_port->int_arm_qe = NULL;
@@ -99,8 +144,9 @@ dlb2_free_qe_mem(struct dlb2_port *qm_port)
 	rte_free(qm_port->consume_qe);
 	qm_port->consume_qe = NULL;
 
-	rte_memzone_free(dlb2_port[qm_port->id][PORT_TYPE(qm_port)].mz);
-	dlb2_port[qm_port->id][PORT_TYPE(qm_port)].mz = NULL;
+	mz = dlb2_port[qm_port->evdev_id][qm_port->id][PORT_TYPE(qm_port)].mz;
+	rte_memzone_free(mz);
+	dlb2_port[qm_port->evdev_id][qm_port->id][PORT_TYPE(qm_port)].mz = NULL;
 }
 
 /* override defaults with value(s) provided on command line */
@@ -119,59 +165,75 @@ dlb2_init_queue_depth_thresholds(struct dlb2_eventdev *dlb2,
 
 /* override defaults with value(s) provided on command line */
 static void
-dlb2_init_cq_weight(struct dlb2_eventdev *dlb2, int *cq_weight)
+dlb2_init_quanta_credits(struct dlb2_eventdev *dlb2,
+			 int *sw_credit_quanta,
+			 int *hw_credit_quanta)
 {
-	int q;
+	int i;
 
-	for (q = 0; q < DLB2_MAX_NUM_PORTS_ALL; q++)
-		dlb2->ev_ports[q].cq_weight = cq_weight[q];
+	for (i = 0; i < DLB2_CREDIT_QUANTA_ARRAY_SZ; i++) {
+		dlb2->sw_credit_quanta[i] = sw_credit_quanta[i];
+		dlb2->hw_credit_quanta[i] = hw_credit_quanta[i];
+	}
+
 }
 
+/* override defaults with value(s) provided on command line */
 static int
-set_cq_weight(const char *key __rte_unused,
-	      const char *value,
-	      void *opaque)
+dlb2_init_port_dequeue_wait(struct dlb2_eventdev *dlb2,
+			    enum dlb2_port_dequeue_wait_types
+				*port_dequeue_wait_modes)
 {
-	struct dlb2_cq_weight *cq_weight = opaque;
-	int first, last, weight, i;
+	int p;
 
-	if (value == NULL || opaque == NULL) {
-		DLB2_LOG_ERR("NULL pointer\n");
-		return -EINVAL;
+	for (p = 0; p < DLB2_MAX_NUM_PORTS(dlb2->version); p++) {
+		if (port_dequeue_wait_modes[p] == DLB2_PORT_DEQUEUE_WAIT_INTERRUPT &&
+		    dlb2->qm_instance.pf_dev) {
+			DLB2_LOG_ERR(": Interrupt mode not supported in PF PMD\n");
+			return -EINVAL;
+		}
+		if (port_dequeue_wait_modes[p] != 0)
+			dlb2->ev_ports[p].qm_port.dequeue_wait =
+				port_dequeue_wait_modes[p];
 	}
-
-	/* command line override may take one of the following 3 forms:
-	 * qid_depth_thresh=all:<threshold_value> ... all queues
-	 * qid_depth_thresh=qidA-qidB:<threshold_value> ... a range of queues
-	 * qid_depth_thresh=qid:<threshold_value> ... just one queue
-	 */
-	if (sscanf(value, "all:%d", &weight) == 1) {
-		first = 0;
-		last = DLB2_MAX_NUM_PORTS_ALL - 1;
-	} else if (sscanf(value, "%d-%d:%d", &first, &last, &weight) == 3) {
-		/* we have everything we need */
-	} else if (sscanf(value, "%d:%d", &first, &weight) == 2) {
-		last = first;
-	} else {
-		DLB2_LOG_ERR("Error parsing ldb port qe weight devarg. Should be all:val, qid-qid:val, or qid:val\n");
-		return -EINVAL;
-	}
-
-	if (first > last || first < 0 ||
-		last >= DLB2_MAX_NUM_PORTS_ALL) {
-		DLB2_LOG_ERR("Error parsing ldb port qe weight arg, invalid port value\n");
-		return -EINVAL;
-	}
-
-	if (weight < 0 || weight > DLB2_MAX_CQ_DEPTH_OVERRIDE) {
-		DLB2_LOG_ERR("Error parsing ldb port qe weight devarg, must be < cq depth\n");
-		return -EINVAL;
-	}
-
-	for (i = first; i <= last; i++)
-		cq_weight->limit[i] = weight; /* indexed by qid */
-
 	return 0;
+}
+
+static void dlb2_init_evdev_rsrcs(struct dlb2_eventdev *dlb2, const char *name)
+{
+	static struct rte_event_dev_info evdev_dlb2_default_info = {
+		.driver_name = "", /* probe will set */
+		.min_dequeue_timeout_ns = DLB2_MIN_DEQUEUE_TIMEOUT_NS,
+		.max_dequeue_timeout_ns = DLB2_MAX_DEQUEUE_TIMEOUT_NS,
+#if (RTE_EVENT_MAX_QUEUES_PER_DEV < DLB2_MAX_NUM_LDB_QUEUES)
+		.max_event_queues = RTE_EVENT_MAX_QUEUES_PER_DEV,
+#else
+		.max_event_queues = DLB2_MAX_NUM_LDB_QUEUES,
+#endif
+		.max_event_queue_flows = DLB2_MAX_NUM_FLOWS,
+		.max_event_queue_priority_levels = DLB2_QID_PRIORITIES,
+		.max_event_priority_levels = DLB2_QID_PRIORITIES,
+		.max_event_ports = DLB2_MAX_NUM_LDB_PORTS,
+		.max_event_port_dequeue_depth = DLB2_DEFAULT_CQ_DEPTH,
+		.max_event_port_enqueue_depth = DLB2_MAX_ENQUEUE_DEPTH,
+		.max_event_port_links = DLB2_MAX_NUM_QIDS_PER_LDB_CQ,
+		.max_num_events = DLB2_MAX_NUM_LDB_CREDITS,
+		.max_single_link_event_port_queue_pairs =
+			DLB2_MAX_NUM_DIR_PORTS(DLB2_HW_V2),
+		.event_dev_cap = (RTE_EVENT_DEV_CAP_EVENT_QOS |
+				  RTE_EVENT_DEV_CAP_BURST_MODE |
+				  RTE_EVENT_DEV_CAP_DISTRIBUTED_SCHED |
+				  RTE_EVENT_DEV_CAP_IMPLICIT_RELEASE_DISABLE |
+				  RTE_EVENT_DEV_CAP_MULTIPLE_QUEUE_PORT |
+				  RTE_EVENT_DEV_CAP_NONSEQ_MODE |
+				  RTE_EVENT_DEV_CAP_MAINTENANCE_FREE |
+					RTE_EVENT_DEV_CAP_QUEUE_ALL_TYPES |
+				  RTE_EVENT_DEV_CAP_RUNTIME_PORT_LINK),
+	};
+	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
+
+	handle->evdev_rsrcs = evdev_dlb2_default_info;
+	handle->evdev_rsrcs.driver_name = name;
 }
 
 /* override defaults with value(s) provided on command line */
@@ -233,23 +295,25 @@ dlb2_hw_query_resources(struct dlb2_eventdev *dlb2)
 	 * The capabilities (CAPs) were set at compile time.
 	 */
 
-	if (dlb2->max_cq_depth != DLB2_DEFAULT_CQ_DEPTH)
-		num_ldb_ports = DLB2_MAX_HL_ENTRIES / dlb2->max_cq_depth;
-	else
-		num_ldb_ports = dlb2->hw_rsrc_query_results.num_ldb_ports;
+	num_ldb_ports = dlb2->hw_rsrc_query_results.num_ldb_ports;
 
-	evdev_dlb2_default_info.max_event_queues =
+	handle->evdev_rsrcs.max_event_queues =
 		dlb2->hw_rsrc_query_results.num_ldb_queues;
 
-	evdev_dlb2_default_info.max_event_ports = num_ldb_ports;
+	handle->evdev_rsrcs.max_event_ports = num_ldb_ports;
+
+	handle->evdev_rsrcs.max_single_link_event_port_queue_pairs =
+		dlb2->hw_rsrc_query_results.num_dir_ports + /* num available */
+		dlb2->num_dir_ports;      /* num in-use */
 
 	if (dlb2->version == DLB2_HW_V2_5) {
-		evdev_dlb2_default_info.max_num_events =
+		handle->evdev_rsrcs.max_num_events =
 			dlb2->hw_rsrc_query_results.num_credits;
 	} else {
-		evdev_dlb2_default_info.max_num_events =
+		handle->evdev_rsrcs.max_num_events =
 			dlb2->hw_rsrc_query_results.num_ldb_credits;
 	}
+
 	/* Save off values used when creating the scheduling domain. */
 
 	handle->info.num_sched_domains =
@@ -277,6 +341,21 @@ dlb2_hw_query_resources(struct dlb2_eventdev *dlb2)
 	handle->info.hw_rsrc_max.reorder_window_size =
 		dlb2->hw_rsrc_query_results.num_hist_list_entries;
 
+	if (handle->num_ordered_queues_0 == 0 &&
+		handle->num_ordered_queues_1 == 0) {
+		/* User did not override, so use all available */
+		handle->req_ordered_queues_0 =
+			dlb2->hw_rsrc_query_results.num_sn_slots[0];
+		handle->req_ordered_queues_1 =
+			dlb2->hw_rsrc_query_results.num_sn_slots[1];
+	} else {
+		/* Use command line overrides */
+		handle->req_ordered_queues_0 =
+			handle->num_ordered_queues_0;
+		handle->req_ordered_queues_1 =
+			handle->num_ordered_queues_1;
+	}
+
 	rte_memcpy(dlb2_info, &handle->info.hw_rsrc_max, sizeof(*dlb2_info));
 
 	return 0;
@@ -284,7 +363,7 @@ dlb2_hw_query_resources(struct dlb2_eventdev *dlb2)
 
 #define DLB2_BASE_10 10
 
-static int
+int
 dlb2_string_to_int(int *result, const char *str)
 {
 	long ret;
@@ -306,19 +385,13 @@ dlb2_string_to_int(int *result, const char *str)
 	return 0;
 }
 
-static int
-set_producer_coremask(const char *key __rte_unused,
-		      const char *value,
-		      void *opaque)
+int
+dlb2_uninit(const char *name)
 {
-	const char **mask_str = opaque;
-
-	if (value == NULL || opaque == NULL) {
-		DLB2_LOG_ERR("NULL pointer\n");
+	if (name == NULL)
 		return -EINVAL;
-	}
 
-	*mask_str = value;
+	RTE_LOG(INFO, PMD, "name=%s\n", name);
 
 	return 0;
 }
@@ -359,7 +432,7 @@ set_max_cq_depth(const char *key __rte_unused,
 	if (*max_cq_depth < DLB2_MIN_CQ_DEPTH_OVERRIDE ||
 	    *max_cq_depth > DLB2_MAX_CQ_DEPTH_OVERRIDE ||
 	    !rte_is_power_of_2(*max_cq_depth)) {
-		DLB2_LOG_ERR("dlb2: max_cq_depth %d and %d and a power of 2\n",
+		DLB2_LOG_ERR("dlb2: Allowed max_cq_depth range %d - %d and should be power of 2\n",
 			     DLB2_MIN_CQ_DEPTH_OVERRIDE,
 			     DLB2_MAX_CQ_DEPTH_OVERRIDE);
 		return -EINVAL;
@@ -370,8 +443,8 @@ set_max_cq_depth(const char *key __rte_unused,
 
 static int
 set_max_enq_depth(const char *key __rte_unused,
-		  const char *value,
-		  void *opaque)
+		 const char *value,
+		 void *opaque)
 {
 	int *max_enq_depth = opaque;
 	int ret;
@@ -389,15 +462,13 @@ set_max_enq_depth(const char *key __rte_unused,
 	    *max_enq_depth > DLB2_MAX_ENQ_DEPTH_OVERRIDE ||
 	    !rte_is_power_of_2(*max_enq_depth)) {
 		DLB2_LOG_ERR("dlb2: max_enq_depth %d and %d and a power of 2\n",
-		DLB2_MIN_ENQ_DEPTH_OVERRIDE,
-		DLB2_MAX_ENQ_DEPTH_OVERRIDE);
+			     DLB2_MIN_ENQ_DEPTH_OVERRIDE,
+			     DLB2_MAX_ENQ_DEPTH_OVERRIDE);
 		return -EINVAL;
 	}
 
 	return 0;
 }
-
-
 static int
 set_max_num_events(const char *key __rte_unused,
 		   const char *value,
@@ -419,6 +490,33 @@ set_max_num_events(const char *key __rte_unused,
 			DLB2_MAX_NUM_LDB_CREDITS) {
 		DLB2_LOG_ERR("dlb2: max_num_events must be between 0 and %d\n",
 			     DLB2_MAX_NUM_LDB_CREDITS);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+set_max_num_events_v2_5(const char *key __rte_unused,
+			const char *value,
+			void *opaque)
+{
+	int *max_num_events = opaque;
+	int ret;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+
+	ret = dlb2_string_to_int(max_num_events, value);
+	if (ret < 0)
+		return ret;
+
+	if (*max_num_events < 0 || *max_num_events >
+			DLB2_MAX_NUM_CREDITS(DLB2_HW_V2_5)) {
+		DLB2_LOG_ERR("dlb2: max_num_events must be between 0 and %d\n",
+			     DLB2_MAX_NUM_CREDITS(DLB2_HW_V2_5));
 		return -EINVAL;
 	}
 
@@ -453,21 +551,39 @@ set_num_dir_credits(const char *key __rte_unused,
 }
 
 static int
-set_dev_id(const char *key __rte_unused,
-	   const char *value,
-	   void *opaque)
+set_hwdev_id(const char *key __rte_unused,
+	     const char *value,
+	     void *opaque)
 {
-	int *dev_id = opaque;
+	int *hwdev_id = opaque;
 	int ret;
+	DIR *check_dir;
+	char hw_dev_path[DLB2_MAX_DEVICE_PATH] = {0};
+	char *hw_devp = &hw_dev_path[0];
 
 	if (value == NULL || opaque == NULL) {
 		DLB2_LOG_ERR("NULL pointer\n");
 		return -EINVAL;
 	}
 
-	ret = dlb2_string_to_int(dev_id, value);
+	ret = dlb2_string_to_int(hwdev_id, value);
 	if (ret < 0)
 		return ret;
+
+	/* HQM-514: check for device availability */
+	snprintf(hw_devp,
+		 DLB2_MAX_DEVICE_PATH,
+		 "/sys/class/dlb2/dlb%d",
+		 *hwdev_id);
+
+	check_dir = opendir(hw_devp);
+
+	if (check_dir == NULL) {
+		DLB2_LOG_ERR("Invalid hwdev_id\n");
+		return -EINVAL;
+	}
+
+	closedir(check_dir);
 
 	return 0;
 }
@@ -562,29 +678,87 @@ set_cos_bw(const char *key __rte_unused,
 	return 0;
 }
 
+int
+dlb2_credit_quanta_parse_params(const char *value,
+				int *quanta_credit,
+				int type)
+{
+	int ret = 0;
+	int worker, producer, consumer, total_quanta;
+	int sw_credit = 0;
+	int hw_credit = 1;
+	/* command line override may take one of the following 2 forms:
+	 * sw_credit_quanta=val or hw_credit_quanta=val, value for worker only,
+	 * rest will be default-P:256, C:256.
+	 * sw_credit_quanta=valw:valp:valc ... value for worker,
+	 * producer and consumer respectively.
+	 */
+
+	if (sscanf(value, "%d:%d:%d", &worker, &producer, &consumer) == 3) {
+
+		if (worker <= 0 || producer <= 0 || consumer <= 0
+				|| worker > DLB2_CREDIT_QUANTA_LIMIT
+				|| producer > DLB2_CREDIT_QUANTA_LIMIT
+				|| consumer > DLB2_CREDIT_QUANTA_LIMIT) {
+			DLB2_LOG_ERR("Error parsing credit quanta, values should be > 0 or < 1024\n");
+			return -EINVAL;
+		}
+
+		total_quanta = worker + producer + consumer;
+
+		if (total_quanta > DLB2_CREDIT_QUANTA_LIMIT) {
+			DLB2_LOG_ERR("Error parsing credit quanta, total quantas exceeded 1024\n");
+			return -EINVAL;
+		}
+
+		quanta_credit[DLB2_CQ_WORKER_INDEX] = worker;
+		quanta_credit[DLB2_CQ_PRODUCER_INDEX] = producer;
+		quanta_credit[DLB2_CQ_CONSUMER_INDEX] = consumer;
+	} else if (sscanf(value, "%d:%d:%d", &worker, &producer, &consumer) == 1) {
+
+		if (worker <= 0 || worker > DLB2_CREDIT_QUANTA_LIMIT) {
+			DLB2_LOG_ERR("Error parsing credit quanta, value should be > 0 or < 1024\n");
+			return -EINVAL;
+		}
+
+		quanta_credit[DLB2_CQ_WORKER_INDEX] = worker;
+
+		if (type == sw_credit) {
+			quanta_credit[DLB2_CQ_PRODUCER_INDEX] = DLB2_SW_CREDIT_P_QUANTA_DEFAULT;
+			quanta_credit[DLB2_CQ_CONSUMER_INDEX] = DLB2_SW_CREDIT_C_QUANTA_DEFAULT;
+		} else if (type == hw_credit) {
+			quanta_credit[DLB2_CQ_PRODUCER_INDEX] = DLB2_SW_CREDIT_P_BATCH_SZ;
+			quanta_credit[DLB2_CQ_CONSUMER_INDEX] = DLB2_SW_CREDIT_C_BATCH_SZ;
+		}
+
+	} else {
+
+		DLB2_LOG_ERR("Error parsing credit quanta, enter hw/sw_credit_quanta:val or hw/sw_credit_quanta=valw:valp:valc\n");
+		return -EINVAL;
+
+	}
+
+	return ret;
+
+}
+
 static int
 set_sw_credit_quanta(const char *key __rte_unused,
 	const char *value,
 	void *opaque)
 {
-	int *sw_credit_quanta = opaque;
-	int ret;
+	int *quanta_credit = opaque;
+	int ret = 0;
+	int type = 0;
 
 	if (value == NULL || opaque == NULL) {
 		DLB2_LOG_ERR("NULL pointer\n");
 		return -EINVAL;
 	}
 
-	ret = dlb2_string_to_int(sw_credit_quanta, value);
-	if (ret < 0)
-		return ret;
+	ret = dlb2_credit_quanta_parse_params(value, quanta_credit, type);
 
-	if (*sw_credit_quanta <= 0) {
-		DLB2_LOG_ERR("sw_credit_quanta must be > 0\n");
-		return -EINVAL;
-	}
-
-	return 0;
+	return ret;
 }
 
 static int
@@ -592,7 +766,27 @@ set_hw_credit_quanta(const char *key __rte_unused,
 	const char *value,
 	void *opaque)
 {
-	int *hw_credit_quanta = opaque;
+	int *quanta_credit = opaque;
+	int ret = 0;
+	int type = 1;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+
+	ret = dlb2_credit_quanta_parse_params(value, quanta_credit, type);
+
+	return ret;
+}
+
+static int
+set_num_ordered_queues(const char *key __rte_unused,
+	const char *value,
+	void *opaque)
+{
+	int *num_ordered_queues = opaque;
+	int x = 0;
 	int ret;
 
 	if (value == NULL || opaque == NULL) {
@@ -600,9 +794,37 @@ set_hw_credit_quanta(const char *key __rte_unused,
 		return -EINVAL;
 	}
 
-	ret = dlb2_string_to_int(hw_credit_quanta, value);
+	ret = dlb2_string_to_int(&x, value);
 	if (ret < 0)
 		return ret;
+
+	if (x < 0 || x > 16) {
+		DLB2_LOG_ERR(
+			"num_ordered_queues_x %d out of range, must be <= 16\n",
+			x);
+		return -EINVAL;
+	}
+
+	*num_ordered_queues = x;
+
+	return 0;
+}
+
+static int
+set_producer_coremask(const char *key __rte_unused,
+	const char *value,
+	void *opaque)
+{
+	char *mask_str = opaque;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+	if (rte_strscpy(mask_str, value, DLB2_COREMASK_LEN) < 0) {
+		DLB2_LOG_ERR("Core mask too long.\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -628,11 +850,11 @@ set_default_depth_thresh(const char *key __rte_unused,
 }
 
 static int
-set_vector_opts_enab(const char *key __rte_unused,
-	const char *value,
-	void *opaque)
+set_vector_opts_disab(const char *key __rte_unused,
+		      const char *value,
+		      void *opaque)
 {
-	bool *dlb2_vector_opts_enabled = opaque;
+	bool *dlb2_vector_opts_disabled = opaque;
 
 	if (value == NULL || opaque == NULL) {
 		DLB2_LOG_ERR("NULL pointer\n");
@@ -640,9 +862,9 @@ set_vector_opts_enab(const char *key __rte_unused,
 	}
 
 	if ((*value == 'y') || (*value == 'Y'))
-		*dlb2_vector_opts_enabled = true;
+		*dlb2_vector_opts_disabled = true;
 	else
-		*dlb2_vector_opts_enabled = false;
+		*dlb2_vector_opts_disabled = false;
 
 	return 0;
 }
@@ -663,6 +885,68 @@ set_default_ldb_port_allocation(const char *key __rte_unused,
 		*default_ldb_port_allocation = true;
 	else
 		*default_ldb_port_allocation = false;
+
+	return 0;
+}
+
+static int
+set_enable_cq_weight(const char *key __rte_unused,
+		      const char *value,
+		      void *opaque)
+{
+	bool *enable_cq_weight = opaque;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+
+	if ((*value == 'y') || (*value == 'Y'))
+		*enable_cq_weight = true;
+	else
+		*enable_cq_weight = false;
+
+	return 0;
+}
+
+static int set_hl_override(const char *key __rte_unused, const char *value,
+			   void *opaque) {
+	bool *default_hl = opaque;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+
+	if ((*value == 'n') || (*value == 'N') || (*value == '0'))
+		*default_hl = false;
+	else
+		*default_hl = true;
+
+	return 0;
+}
+
+static int set_hl_entries(const char *key __rte_unused, const char *value,
+			  void *opaque) {
+	int hl_entries;
+	int ret;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+
+	ret = dlb2_string_to_int(&hl_entries, value);
+	if (ret < 0)
+		return ret;
+
+	if ((uint32_t)hl_entries > DLB2_MAX_HL_ENTRIES) {
+		DLB2_LOG_ERR(
+		    "alloc_hl_entries %u out of range, must be in [1 - %d]\n",
+		    hl_entries, DLB2_MAX_HL_ENTRIES);
+		return -EINVAL;
+	}
+	*(uint32_t *)opaque = hl_entries;
 
 	return 0;
 }
@@ -763,11 +1047,117 @@ set_qid_depth_thresh_v2_5(const char *key __rte_unused,
 	return 0;
 }
 
+static int
+set_port_dequeue_wait_ver(const char *key __rte_unused,
+			  const char *value,
+			  void *opaque,
+			  int version)
+{
+	struct dlb2_port_dequeue_wait *dequeue_wait = opaque;
+	int first, last;
+	enum dlb2_port_dequeue_wait_types wait;
+	const char *valp = value;
+	bool port_list[DLB2_MAX_NUM_PORTS_ALL] = {false};
+	int lmax = DLB2_MAX_NUM_PORTS(version);
+	int len;
+	int lc;
+
+	if (value == NULL || opaque == NULL) {
+		DLB2_LOG_ERR("NULL pointer\n");
+		return -EINVAL;
+	}
+
+	/* command line override may take a combination of the following forms:
+	 * port_dequeue_wait=all:<wait_mode> ... all ports
+	 * port_dequeue_wait=portA-portB:<wait_mode> ... a range of ports
+	 * port_dequeue_wait=portA:<wait_mode> ... just one port
+	 */
+
+	do {
+		do {
+			if (strncmp(valp, "all", 3) == 0) {
+				for (lc = 0; lc < lmax; lc++)
+					port_list[lc] = true;
+				valp += 3;
+			} else if (sscanf(valp, "%d-%d%n",
+					  &first,
+					  &last,
+					  &len) == 2) {
+				if ((first < 0) ||
+				    (last >= lmax) ||
+				    (first > last)) {
+					DLB2_LOG_ERR("Invalid portId\n");
+					return -EINVAL;
+				}
+				for (lc = first; lc <= last; lc++)
+					port_list[lc] = true;
+				valp += len;
+			} else if (sscanf(valp, "%d%n",
+					  &first,
+					  &len) == 1) {
+				if ((first < 0) ||
+				    (first >= lmax)) {
+					DLB2_LOG_ERR("Invalid portId\n");
+					return -EINVAL;
+				}
+				port_list[first] = true;
+				valp += len;
+			}
+		} while (strncmp(valp, "+", 1) == 0);
+
+		if (strncmp(valp++, ":", 1) == 0) {
+			if (strncmp(valp, "interrupt", 9) == 0) {
+				wait = DLB2_PORT_DEQUEUE_WAIT_INTERRUPT;
+				len = 9;
+			} else if (strncmp(valp, "polling", 7) == 0) {
+				wait = DLB2_PORT_DEQUEUE_WAIT_POLLING;
+				len = 7;
+			} else if (strncmp(valp, "umwait", 6) == 0) {
+				wait = DLB2_PORT_DEQUEUE_WAIT_UMWAIT;
+				len = 6;
+			} else {
+				DLB2_LOG_ERR("Error parsing port wait mode devarg, invalid mode\n");
+				return -EINVAL;
+			}
+
+			valp += len;
+
+			for (lc = 0; lc < lmax; lc++)
+				if (port_list[lc]) {
+					dequeue_wait->val[lc] = wait;
+					port_list[lc] = false;
+				}
+		} else {
+			DLB2_LOG_ERR("Error parsing port wait mode devarg. Should be all:val, portId-portId:val, or portId:val\n");
+			return -EINVAL;
+		}
+	} while (strncmp(valp++, "_", 1) == 0);
+
+	return 0;
+}
+
+static int
+set_port_dequeue_wait(const char *key __rte_unused,
+		      const char *value,
+		      void *opaque)
+{
+	return set_port_dequeue_wait_ver(key, value, opaque, DLB2_HW_V2);
+}
+
+static int
+set_port_dequeue_wait_v2_5(const char *key __rte_unused,
+		      const char *value,
+		      void *opaque)
+{
+	return set_port_dequeue_wait_ver(key, value, opaque, DLB2_HW_V2_5);
+}
+
 static void
 dlb2_eventdev_info_get(struct rte_eventdev *dev,
 		       struct rte_event_dev_info *dev_info)
 {
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
+	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
 	int ret;
 
 	ret = dlb2_hw_query_resources(dlb2);
@@ -786,24 +1176,24 @@ dlb2_eventdev_info_get(struct rte_eventdev *dev,
 	 * to the application recalling eventdev_configure to *reconfigure* the
 	 * domain.
 	 */
-	evdev_dlb2_default_info.max_event_ports += dlb2->num_ldb_ports;
-	evdev_dlb2_default_info.max_event_queues += dlb2->num_ldb_queues;
+	handle->evdev_rsrcs.max_event_ports += dlb2->num_ldb_ports;
+	handle->evdev_rsrcs.max_event_queues += dlb2->num_ldb_queues;
 	if (dlb2->version == DLB2_HW_V2_5) {
-		evdev_dlb2_default_info.max_num_events +=
+		handle->evdev_rsrcs.max_num_events +=
 			dlb2->max_credits;
 	} else {
-		evdev_dlb2_default_info.max_num_events +=
+		handle->evdev_rsrcs.max_num_events +=
 			dlb2->max_ldb_credits;
 	}
-	evdev_dlb2_default_info.max_event_queues =
-		RTE_MIN(evdev_dlb2_default_info.max_event_queues,
+	handle->evdev_rsrcs.max_event_queues =
+		RTE_MIN(handle->evdev_rsrcs.max_event_queues,
 			RTE_EVENT_MAX_QUEUES_PER_DEV);
 
-	evdev_dlb2_default_info.max_num_events =
-		RTE_MIN(evdev_dlb2_default_info.max_num_events,
+	handle->evdev_rsrcs.max_num_events =
+		RTE_MIN(handle->evdev_rsrcs.max_num_events,
 			dlb2->max_num_events_override);
 
-	*dev_info = evdev_dlb2_default_info;
+	*dev_info = handle->evdev_rsrcs;
 }
 
 static int
@@ -864,26 +1254,76 @@ dlb2_hw_create_sched_domain(struct dlb2_eventdev *dlb2,
 		DLB2_NUM_ATOMIC_INFLIGHTS_PER_QUEUE *
 		cfg->num_ldb_queues;
 
-	cfg->num_hist_list_entries = resources_asked->num_ldb_ports *
-		evdev_dlb2_default_info.max_event_port_dequeue_depth;
+	/* If hl_entries is non-zero then user specified command line option.
+	 * Else compute using default_port_hl that has been set earlier based
+	 * on use_default_hl option
+	 */
+	if (dlb2->hl_entries) {
+		cfg->num_hist_list_entries = dlb2->hl_entries;
+		dlb2->default_port_hl = cfg->num_hist_list_entries /
+					resources_asked->num_ldb_ports;
+	} else {
+		cfg->num_hist_list_entries =
+		    resources_asked->num_ldb_ports * dlb2->default_port_hl;
+	}
+
+	if (handle->req_ordered_queues_0 >
+			dlb2->hw_rsrc_query_results.num_sn_slots[0] ||
+		handle->req_ordered_queues_1 >
+			dlb2->hw_rsrc_query_results.num_sn_slots[1]) {
+		DLB2_LOG_ERR("dlb2: domain create failed, cmd line requested %d,%d ordered queues, but only %d,%d slots available\n",
+		    handle->req_ordered_queues_0, handle->req_ordered_queues_1,
+		    dlb2->hw_rsrc_query_results.num_sn_slots[0],
+		    dlb2->hw_rsrc_query_results.num_sn_slots[1]);
+		ret = -ENOSPC;
+		goto error_exit;
+	}
+	if (handle->num_ordered_queues_0 == 0 &&
+		handle->num_ordered_queues_1 == 0) {
+		/*
+		 * number of ordered queues_X was not specified, so allocate
+		 * just enough to cover the number of load balanced queues,
+		 * assuming they're all ordered.
+		 */
+		if (cfg->num_ldb_queues <= handle->req_ordered_queues_0) {
+			cfg->num_sn_slots[0] = cfg->num_ldb_queues;
+			cfg->num_sn_slots[1] = 0;
+		} else {
+			cfg->num_sn_slots[0] = handle->req_ordered_queues_0;
+			cfg->num_sn_slots[1] = cfg->num_ldb_queues -
+					handle->req_ordered_queues_0;
+		}
+	} else {
+		/*
+		 * Use exact number specified, Note that the cmdline specified
+		 * num_ordered == req_ordered, so below is just more readable
+		 * and instructive.
+		 */
+		cfg->num_sn_slots[0] = handle->num_ordered_queues_0;
+		cfg->num_sn_slots[1] = handle->num_ordered_queues_1;
+	}
 
 	if (device_version == DLB2_HW_V2_5) {
-		DLB2_LOG_DBG("sched domain create - ldb_qs=%d, ldb_ports=%d, dir_ports=%d, atomic_inflights=%d, hist_list_entries=%d, credits=%d\n",
+		DLB2_LOG_DBG("sched domain create - ldb_qs=%d, ldb_ports=%d, dir_ports=%d, atomic_inflights=%d, hist_list_entries=%d, credits=%d, sn=%d,%d\n",
 			     cfg->num_ldb_queues,
 			     resources_asked->num_ldb_ports,
 			     cfg->num_dir_ports,
 			     cfg->num_atomic_inflights,
 			     cfg->num_hist_list_entries,
-			     cfg->num_credits);
+			     cfg->num_credits,
+			     cfg->num_sn_slots[0],
+			     cfg->num_sn_slots[1]);
 	} else {
-		DLB2_LOG_DBG("sched domain create - ldb_qs=%d, ldb_ports=%d, dir_ports=%d, atomic_inflights=%d, hist_list_entries=%d, ldb_credits=%d, dir_credits=%d\n",
+		DLB2_LOG_DBG("sched domain create - ldb_qs=%d, ldb_ports=%d, dir_ports=%d, atomic_inflights=%d, hist_list_entries=%d, ldb_credits=%d, dir_credits=%d, sn=%d,%d\n",
 			     cfg->num_ldb_queues,
 			     resources_asked->num_ldb_ports,
 			     cfg->num_dir_ports,
 			     cfg->num_atomic_inflights,
 			     cfg->num_hist_list_entries,
 			     cfg->num_ldb_credits,
-			     cfg->num_dir_credits);
+			     cfg->num_dir_credits,
+			     cfg->num_sn_slots[0],
+			     cfg->num_sn_slots[1]);
 	}
 
 	/* Configure the QM */
@@ -898,6 +1338,7 @@ dlb2_hw_create_sched_domain(struct dlb2_eventdev *dlb2,
 	}
 
 	handle->domain_id = cfg->response.id;
+	handle->domain_id_valid = 1;
 	handle->cfg.configured = true;
 
 error_exit:
@@ -905,18 +1346,27 @@ error_exit:
 	return ret;
 }
 
-static void
+static int
 dlb2_hw_reset_sched_domain(const struct rte_eventdev *dev, bool reconfig)
 {
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
 	enum dlb2_configuration_state config_state;
-	int i, j;
+	enum dlb2_configuration_state prev_config_state[DLB2_MAX_NUM_PORTS_ALL];
+	int i, j, ret;
 
-	dlb2_iface_domain_reset(dlb2);
+	ret = dlb2_iface_domain_reset(dlb2);
+	if (ret) {
+		DLB2_LOG_ERR("dlb2_hw_reset_domain err %d", ret);
+		return ret;
+	}
 
 	/* Free all dynamically allocated port memory */
-	for (i = 0; i < dlb2->num_ports; i++)
+	for (i = 0; i < dlb2->num_ports; i++) {
+		prev_config_state[i] = dlb2->ev_ports[i].qm_port.config_state;
 		dlb2_free_qe_mem(&dlb2->ev_ports[i].qm_port);
+		if (!reconfig)
+			memset(&dlb2->ev_ports[i], 0, sizeof(struct dlb2_eventdev_port));
+	}
 
 	/* If reconfiguring, mark the device's queues and ports as "previously
 	 * configured." If the user doesn't reconfigure them, the PMD will
@@ -926,7 +1376,10 @@ dlb2_hw_reset_sched_domain(const struct rte_eventdev *dev, bool reconfig)
 		DLB2_NOT_CONFIGURED;
 
 	for (i = 0; i < dlb2->num_ports; i++) {
-		dlb2->ev_ports[i].qm_port.config_state = config_state;
+		/* Retain configuration status before reconfig */
+		dlb2->ev_ports[i].qm_port.config_state =
+			(prev_config_state[i] == DLB2_NOT_CONFIGURED) ?
+			DLB2_NOT_CONFIGURED : config_state;
 		/* Reset setup_done so ports can be reconfigured */
 		dlb2->ev_ports[i].setup_done = false;
 		for (j = 0; j < DLB2_MAX_NUM_QIDS_PER_LDB_CQ; j++)
@@ -945,7 +1398,18 @@ dlb2_hw_reset_sched_domain(const struct rte_eventdev *dev, bool reconfig)
 	dlb2->num_queues = 0;
 	dlb2->num_ldb_queues = 0;
 	dlb2->num_dir_queues = 0;
+	if (dlb2->version == DLB2_HW_V2_5) {
+		dlb2->num_credits = 0;
+		dlb2->max_credits = 0;
+	} else {
+		dlb2->num_ldb_credits = 0;
+		dlb2->num_dir_credits = 0;
+		dlb2->max_ldb_credits = 0;
+		dlb2->max_dir_credits = 0;
+	}
 	dlb2->configured = false;
+
+	return 0;
 }
 
 /* Note: 1 QM instance per QM device, QM instance/device == event device */
@@ -963,7 +1427,9 @@ dlb2_eventdev_configure(const struct rte_eventdev *dev)
 	 * scheduling domain before attempting to configure a new one.
 	 */
 	if (dlb2->configured) {
-		dlb2_hw_reset_sched_domain(dev, true);
+		ret = dlb2_hw_reset_sched_domain(dev, true);
+		if (ret)
+			return ret;
 		ret = dlb2_hw_query_resources(dlb2);
 		if (ret) {
 			DLB2_LOG_ERR("get resources err=%d, devid=%d\n",
@@ -1007,8 +1473,15 @@ dlb2_eventdev_configure(const struct rte_eventdev *dev)
 	}
 
 	/* Does this platform support umonitor/umwait? */
-	if (rte_cpu_get_flag_enabled(RTE_CPUFLAG_WAITPKG))
+	if (rte_cpu_get_flag_enabled(RTE_CPUFLAG_WAITPKG)) {
+		if (RTE_LIBRTE_PMD_DLB2_UMWAIT_CTL_STATE != 0 &&
+		    RTE_LIBRTE_PMD_DLB2_UMWAIT_CTL_STATE != 1) {
+			DLB2_LOG_ERR("invalid value (%d) for RTE_LIBRTE_PMD_DLB2_UMWAIT_CTL_STATE, must be 0 or 1.\n",
+				     RTE_LIBRTE_PMD_DLB2_UMWAIT_CTL_STATE);
+			return -EINVAL;
+		}
 		dlb2->umwait_allowed = true;
+	}
 
 	rsrcs->num_dir_ports = config->nb_single_link_event_port_queues;
 	rsrcs->num_ldb_ports  = config->nb_event_ports - rsrcs->num_dir_ports;
@@ -1053,13 +1526,17 @@ dlb2_eventdev_configure(const struct rte_eventdev *dev)
 	if (dlb2->version == DLB2_HW_V2_5) {
 		dlb2->credit_pool = rsrcs->num_credits;
 		dlb2->max_credits = rsrcs->num_credits;
+		dlb2->num_credits = rsrcs->num_credits;
 	} else {
 		dlb2->ldb_credit_pool = rsrcs->num_ldb_credits;
 		dlb2->max_ldb_credits = rsrcs->num_ldb_credits;
+		dlb2->num_ldb_credits = rsrcs->num_ldb_credits;
 		dlb2->dir_credit_pool = rsrcs->num_dir_credits;
 		dlb2->max_dir_credits = rsrcs->num_dir_credits;
+		dlb2->num_dir_credits = rsrcs->num_dir_credits;
 	}
 
+	dlb2->evdev_id = dev->data->dev_id;
 	dlb2->configured = true;
 
 	return 0;
@@ -1074,8 +1551,8 @@ dlb2_eventdev_port_default_conf_get(struct rte_eventdev *dev,
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
 
 	port_conf->new_event_threshold = dlb2->new_event_limit;
-	port_conf->dequeue_depth = 32;
-	port_conf->enqueue_depth = DLB2_MAX_ENQUEUE_DEPTH;
+	port_conf->dequeue_depth = dlb2->default_port_hl / 2;
+	port_conf->enqueue_depth = dlb2->qm_instance.evdev_rsrcs.max_event_port_enqueue_depth;
 	port_conf->event_port_cfg = 0;
 }
 
@@ -1094,7 +1571,7 @@ dlb2_eventdev_queue_default_conf_get(struct rte_eventdev *dev,
 }
 
 static int32_t
-dlb2_get_sn_allocation(struct dlb2_eventdev *dlb2, int group)
+dlb2_get_sn_allocation(struct dlb2_eventdev *dlb2, uint32_t group)
 {
 	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
 	struct dlb2_get_sn_allocation_args cfg;
@@ -1113,7 +1590,7 @@ dlb2_get_sn_allocation(struct dlb2_eventdev *dlb2, int group)
 }
 
 static int
-dlb2_set_sn_allocation(struct dlb2_eventdev *dlb2, int group, int num)
+dlb2_set_sn_allocation(struct dlb2_eventdev *dlb2, uint32_t group, uint32_t num)
 {
 	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
 	struct dlb2_set_sn_allocation_args cfg;
@@ -1162,9 +1639,9 @@ dlb2_program_sn_allocation(struct dlb2_eventdev *dlb2,
 {
 	int grp_occupancy[DLB2_NUM_SN_GROUPS];
 	int grp_alloc[DLB2_NUM_SN_GROUPS];
-	int i, sequence_numbers;
+	uint32_t i, sequence_numbers;
 
-	sequence_numbers = (int)queue_conf->nb_atomic_order_sequences;
+	sequence_numbers = queue_conf->nb_atomic_order_sequences;
 
 	for (i = 0; i < DLB2_NUM_SN_GROUPS; i++) {
 		int total_slots;
@@ -1182,7 +1659,7 @@ dlb2_program_sn_allocation(struct dlb2_eventdev *dlb2,
 		/* DLB has at least one available slot for the requested
 		 * sequence numbers, so no further configuration required.
 		 */
-		if (grp_alloc[i] == sequence_numbers &&
+		if (grp_alloc[i] == (int)sequence_numbers &&
 		    grp_occupancy[i] < total_slots)
 			return;
 	}
@@ -1221,21 +1698,23 @@ dlb2_hw_create_ldb_queue(struct dlb2_eventdev *dlb2,
 	uint32_t qm_qid;
 	int sched_type = -1;
 
-	if (evq_conf == NULL)
+	if (evq_conf == NULL) 
 		return -EINVAL;
 
-	if (evq_conf->event_queue_cfg & RTE_EVENT_QUEUE_CFG_ALL_TYPES) {
-		if (evq_conf->nb_atomic_order_sequences != 0)
-			sched_type = RTE_SCHED_TYPE_ORDERED;
-		else
-			sched_type = RTE_SCHED_TYPE_PARALLEL;
-	} else
-		sched_type = evq_conf->schedule_type;
+  if (evq_conf->event_queue_cfg & RTE_EVENT_QUEUE_CFG_ALL_TYPES) {
+    if (evq_conf->nb_atomic_order_sequences != 0)
+      sched_type = RTE_SCHED_TYPE_ORDERED;
+    else
+      sched_type = RTE_SCHED_TYPE_PARALLEL;
+  } else
+    sched_type = evq_conf->schedule_type;
 
+	/* Atomic events are allowed on any queue type */
 	cfg.num_atomic_inflights = DLB2_NUM_ATOMIC_INFLIGHTS_PER_QUEUE;
 	cfg.num_sequence_numbers = evq_conf->nb_atomic_order_sequences;
 	cfg.num_qid_inflights = evq_conf->nb_atomic_order_sequences;
 
+  /* For atomic and un-ordered queues, QID inflight = 2048 and sn = 0 */
 	if (sched_type != RTE_SCHED_TYPE_ORDERED) {
 		cfg.num_sequence_numbers = 0;
 		cfg.num_qid_inflights = 2048;
@@ -1264,9 +1743,8 @@ dlb2_hw_create_ldb_queue(struct dlb2_eventdev *dlb2,
 	}
 
 	if (ev_queue->depth_threshold == 0) {
-		cfg.depth_threshold = dlb2->default_depth_thresh;
-		ev_queue->depth_threshold =
-			dlb2->default_depth_thresh;
+		cfg.depth_threshold = RTE_PMD_DLB2_DEFAULT_DEPTH_THRESH;
+		ev_queue->depth_threshold = RTE_PMD_DLB2_DEFAULT_DEPTH_THRESH;
 	} else
 		cfg.depth_threshold = ev_queue->depth_threshold;
 
@@ -1303,7 +1781,7 @@ dlb2_eventdev_ldb_queue_setup(struct rte_eventdev *dev,
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
 	int32_t qm_qid;
 
-	if (queue_conf->nb_atomic_order_sequences)
+	if (queue_conf->nb_atomic_order_sequences && dlb2->is_vdev == false)
 		dlb2_program_sn_allocation(dlb2, queue_conf);
 
 	qm_qid = dlb2_hw_create_ldb_queue(dlb2, ev_queue, queue_conf);
@@ -1481,6 +1959,17 @@ dlb2_init_qe_mem(struct dlb2_port *qm_port, char *mz_name)
 		goto error_exit;
 	}
 
+	if (qm_port->reorder_en) {
+		sz = sizeof(struct dlb2_reorder);
+		qm_port->order = rte_zmalloc(mz_name, sz, RTE_CACHE_LINE_SIZE);
+
+		if (qm_port->order == NULL) {
+			DLB2_LOG_ERR("dlb2: no reorder memory\n");
+			ret = -ENOMEM;
+			goto error_exit;
+		}
+	}
+
 	ret = dlb2_init_int_arm_qe(qm_port, mz_name);
 	if (ret < 0) {
 		DLB2_LOG_ERR("dlb2: dlb2_init_int_arm_qe ret=%d\n", ret);
@@ -1536,7 +2025,7 @@ dlb2_hw_cq_bitmask_init(struct dlb2_port *qm_port, uint32_t cq_depth)
 		return; /* need to fall back to scalar code */
 
 	/*
-	 * all 1's in first u64, all zeros in second is correct bit pattern to
+	 * all 1's in first u64, all zeros in 2nd is correct bit pattern to
 	 * start. Special casing == 64 easier than adapting complex loop logic.
 	 */
 	if (cq_depth == 64) {
@@ -1555,18 +2044,15 @@ dlb2_hw_cq_bitmask_init(struct dlb2_port *qm_port, uint32_t cq_depth)
 static int
 dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 			struct dlb2_eventdev_port *ev_port,
-			uint32_t dequeue_depth,
-			uint32_t enqueue_depth)
+			uint32_t dequeue_depth)
 {
 	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
 	struct dlb2_create_ldb_port_args cfg = { {0} };
-	int ret;
-	struct dlb2_port *qm_port = NULL;
+	struct dlb2_port *qm_port = &ev_port->qm_port;
+	struct process_local_port_data *port_data;
 	char mz_name[RTE_MEMZONE_NAMESIZE];
 	uint32_t qm_port_id;
-	uint16_t ldb_credit_high_watermark = 0;
-	uint16_t dir_credit_high_watermark = 0;
-	uint16_t credit_high_watermark = 0;
+	int ret;
 
 	if (handle == NULL)
 		return -EINVAL;
@@ -1577,43 +2063,33 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 		return -EINVAL;
 	}
 
-	if (dlb2->version == DLB2_HW_V2 && ev_port->cq_weight != 0 &&
-	    ev_port->cq_weight > dequeue_depth) {
-		DLB2_LOG_ERR("dlb2: invalid cq dequeue depth %d, must be >= cq weight %d\n",
-			     dequeue_depth, ev_port->cq_weight);
-		return -EINVAL;
-	}
-
 	rte_spinlock_lock(&handle->resource_lock);
 
 	/* We round up to the next power of 2 if necessary */
 	cfg.cq_depth = rte_align32pow2(dequeue_depth);
 	cfg.cq_depth_threshold = 1;
 
-	cfg.cq_history_list_size = cfg.cq_depth;
+	if (dlb2->version == DLB2_HW_V2_5 && qm_port->enable_inflight_ctrl) {
+		cfg.enable_inflight_ctrl = 1;
+		cfg.inflight_threshold = qm_port->inflight_threshold;
+	}
+
+	if (qm_port->hist_list)
+		cfg.cq_history_list_size = qm_port->hist_list;
+	else if (cfg.enable_inflight_ctrl)
+		cfg.cq_history_list_size = RTE_MIN(cfg.cq_depth, dlb2->default_port_hl);
+	else if (dlb2->default_port_hl == DLB2_FIXED_CQ_HL_SIZE)
+		cfg.cq_history_list_size = DLB2_FIXED_CQ_HL_SIZE;
+	else
+		cfg.cq_history_list_size = cfg.cq_depth * 2;
 
 	cfg.cos_id = ev_port->cos_id;
 	cfg.cos_strict = 0;/* best effots */
 
-	/* User controls the LDB high watermark via enqueue depth. The DIR high
-	 * watermark is equal, unless the directed credit pool is too small.
-	 */
-	if (dlb2->version == DLB2_HW_V2) {
-		ldb_credit_high_watermark = enqueue_depth;
-		/* If there are no directed ports, the kernel driver will
-		 * ignore this port's directed credit settings. Don't use
-		 * enqueue_depth if it would require more directed credits
-		 * than are available.
-		 */
-		dir_credit_high_watermark =
-			RTE_MIN(enqueue_depth,
-				handle->cfg.num_dir_credits / dlb2->num_ports);
-	} else
-		credit_high_watermark = enqueue_depth;
-
 	/* Per QM values */
 
-	ret = dlb2_iface_ldb_port_create(handle, &cfg,  dlb2->poll_mode);
+	ret = dlb2_iface_ldb_port_create(handle, &cfg,  dlb2->poll_mode,
+					 dlb2->evdev_id);
 	if (ret < 0) {
 		DLB2_LOG_ERR("dlb2: dlb2_ldb_port_create error, ret=%d (driver status: %s)\n",
 			     ret, dlb2_error_strings[cfg.response.status]);
@@ -1625,7 +2101,7 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 	DLB2_LOG_DBG("dlb2: ev_port %d uses qm LB port %d <<<<<\n",
 		     ev_port->id, qm_port_id);
 
-	qm_port = &ev_port->qm_port;
+	qm_port->evdev_id = dlb2->evdev_id;
 	qm_port->ev_port = ev_port; /* back ptr */
 	qm_port->dlb2 = dlb2; /* back ptr */
 	/*
@@ -1647,12 +2123,15 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 	if (dlb2->version == DLB2_HW_V2) {
 		qm_port->cached_ldb_credits = 0;
 		qm_port->cached_dir_credits = 0;
-		if (ev_port->cq_weight) {
+	} else
+		qm_port->cached_credits = 0;
+
+	if (dlb2->version == DLB2_HW_V2_5 && (dlb2->enable_cq_weight == true)) {
 			struct dlb2_enable_cq_weight_args
 				cq_weight_args = { {0} };
 
 			cq_weight_args.port_id = qm_port->id;
-			cq_weight_args.limit = ev_port->cq_weight;
+			cq_weight_args.limit = dequeue_depth;
 			ret = dlb2_iface_enable_cq_weight(handle, &cq_weight_args);
 			if (ret < 0) {
 				DLB2_LOG_ERR("dlb2: dlb2_dir_port_create error, ret=%d (driver status: %s)\n",
@@ -1660,11 +2139,6 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 					dlb2_error_strings[cfg.response.  status]);
 				goto error_exit;
 			}
-		}
-		qm_port->cq_weight = ev_port->cq_weight;
-	} else {
-		qm_port->cached_credits = 0;
-		qm_port->cq_weight = 0;
 	}
 
 	/* CQs with depth < 8 use an 8-entry queue, but withhold credits so
@@ -1709,33 +2183,45 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 	qm_port->owed_tokens = 0;
 	qm_port->issued_releases = 0;
 
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
 	/* Save config message too. */
 	rte_memcpy(&qm_port->cfg.ldb, &cfg, sizeof(qm_port->cfg.ldb));
 
 	/* update state */
 	qm_port->state = PORT_STARTED; /* enabled at create time */
 	qm_port->config_state = DLB2_CONFIGURED;
+	port_data->use_ded_autopop_cl = false;
 
 	if (dlb2->version == DLB2_HW_V2) {
-		qm_port->dir_credits = dir_credit_high_watermark;
-		qm_port->ldb_credits = ldb_credit_high_watermark;
 		qm_port->credit_pool[DLB2_DIR_QUEUE] = &dlb2->dir_credit_pool;
 		qm_port->credit_pool[DLB2_LDB_QUEUE] = &dlb2->ldb_credit_pool;
 
-		DLB2_LOG_DBG("dlb2: created ldb port %d, depth = %d, ldb credits=%d, dir credits=%d\n",
+		DLB2_LOG_DBG("dlb2: created ldb port %d, depth = %d\n",
 			     qm_port_id,
-			     dequeue_depth,
-			     qm_port->ldb_credits,
-			     qm_port->dir_credits);
+			     dequeue_depth);
 	} else {
-		qm_port->credits = credit_high_watermark;
 		qm_port->credit_pool[DLB2_COMBINED_POOL] = &dlb2->credit_pool;
 
-		DLB2_LOG_DBG("dlb2: created ldb port %d, depth = %d, credits=%d\n",
+		DLB2_LOG_DBG("dlb2: created ldb port %d, depth = %d\n",
 			     qm_port_id,
-			     dequeue_depth,
-			     qm_port->credits);
+			     dequeue_depth);
+
+		if (qm_port->token_pop_mode == AUTO_POP)
+			port_data->use_ded_autopop_cl = true;
+
 	}
+
+	/*
+	 * NPF-2161: For PF PMD. Will be overwritten for bifurcated mode when
+	 * port is mmapped
+	 */
+	if (port_data->use_ded_autopop_cl)
+		port_data->autopop_addr = port_data->pp_addr +
+			DLB2_NUM_BYTES_PER_CACHE_LINE;
+	else
+		port_data->autopop_addr = port_data->pp_addr;
 
 	qm_port->use_scalar = false;
 
@@ -1744,7 +2230,7 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 #else
 	if ((qm_port->cq_depth > 64) ||
 	    (!rte_is_power_of_2(qm_port->cq_depth)) ||
-	    (dlb2->vector_opts_enabled == false))
+	    (dlb2->vector_opts_disab == true))
 		qm_port->use_scalar = true;
 #endif
 
@@ -1754,8 +2240,7 @@ dlb2_hw_create_ldb_port(struct dlb2_eventdev *dlb2,
 
 error_exit:
 
-	if (qm_port)
-		dlb2_free_qe_mem(qm_port);
+	dlb2_free_qe_mem(qm_port);
 
 	rte_spinlock_unlock(&handle->resource_lock);
 
@@ -1793,11 +2278,9 @@ dlb2_hw_create_dir_port(struct dlb2_eventdev *dlb2,
 	struct dlb2_create_dir_port_args cfg = { {0} };
 	int ret;
 	struct dlb2_port *qm_port = NULL;
+	struct process_local_port_data *port_data;
 	char mz_name[RTE_MEMZONE_NAMESIZE];
 	uint32_t qm_port_id;
-	uint16_t ldb_credit_high_watermark = 0;
-	uint16_t dir_credit_high_watermark = 0;
-	uint16_t credit_high_watermark = 0;
 
 	if (dlb2 == NULL || handle == NULL)
 		return -EINVAL;
@@ -1823,26 +2306,12 @@ dlb2_hw_create_dir_port(struct dlb2_eventdev *dlb2,
 	cfg.cq_depth = rte_align32pow2(dequeue_depth);
 	cfg.cq_depth_threshold = 1;
 
-	/* User controls the LDB high watermark via enqueue depth. The DIR high
-	 * watermark is equal, unless the directed credit pool is too small.
-	 */
-	if (dlb2->version == DLB2_HW_V2) {
-		ldb_credit_high_watermark = enqueue_depth;
-		/* Don't use enqueue_depth if it would require more directed
-		 * credits than are available.
-		 */
-		dir_credit_high_watermark =
-			RTE_MIN(enqueue_depth,
-				handle->cfg.num_dir_credits / dlb2->num_ports);
-	} else
-		credit_high_watermark = enqueue_depth;
-
 	if (ev_port->conf.event_port_cfg & RTE_EVENT_PORT_CFG_HINT_PRODUCER)
 		cfg.is_producer = 1;
-
 	/* Per QM values */
 
-	ret = dlb2_iface_dir_port_create(handle, &cfg,  dlb2->poll_mode);
+	ret = dlb2_iface_dir_port_create(handle, &cfg,  dlb2->poll_mode,
+					 dlb2->evdev_id);
 	if (ret < 0) {
 		DLB2_LOG_ERR("dlb2: dlb2_dir_port_create error, ret=%d (driver status: %s)\n",
 			     ret, dlb2_error_strings[cfg.response.status]);
@@ -1855,6 +2324,7 @@ dlb2_hw_create_dir_port(struct dlb2_eventdev *dlb2,
 		     ev_port->id, qm_port_id);
 
 	qm_port = &ev_port->qm_port;
+	qm_port->evdev_id = dlb2->evdev_id;
 	qm_port->ev_port = ev_port; /* back ptr */
 	qm_port->dlb2 = dlb2;  /* back ptr */
 
@@ -1910,40 +2380,52 @@ dlb2_hw_create_dir_port(struct dlb2_eventdev *dlb2,
 	qm_port->owed_tokens = 0;
 	qm_port->issued_releases = 0;
 
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
 	/* Save config message too. */
 	rte_memcpy(&qm_port->cfg.dir, &cfg, sizeof(qm_port->cfg.dir));
 
 	/* update state */
 	qm_port->state = PORT_STARTED; /* enabled at create time */
 	qm_port->config_state = DLB2_CONFIGURED;
+	port_data->use_ded_autopop_cl = false;
 
 	if (dlb2->version == DLB2_HW_V2) {
-		qm_port->dir_credits = dir_credit_high_watermark;
-		qm_port->ldb_credits = ldb_credit_high_watermark;
 		qm_port->credit_pool[DLB2_DIR_QUEUE] = &dlb2->dir_credit_pool;
 		qm_port->credit_pool[DLB2_LDB_QUEUE] = &dlb2->ldb_credit_pool;
 
-		DLB2_LOG_DBG("dlb2: created dir port %d, depth = %d cr=%d,%d\n",
+		DLB2_LOG_DBG("dlb2: created dir port %d, depth = %d\n",
 			     qm_port_id,
-			     dequeue_depth,
-			     dir_credit_high_watermark,
-			     ldb_credit_high_watermark);
+			     dequeue_depth);
 	} else {
-		qm_port->credits = credit_high_watermark;
 		qm_port->credit_pool[DLB2_COMBINED_POOL] = &dlb2->credit_pool;
 
-		DLB2_LOG_DBG("dlb2: created dir port %d, depth = %d cr=%d\n",
+		DLB2_LOG_DBG("dlb2: created dir port %d, depth = %d\n",
 			     qm_port_id,
-			     dequeue_depth,
-			     credit_high_watermark);
+			     dequeue_depth);
+		if (qm_port->token_pop_mode == AUTO_POP)
+			port_data->use_ded_autopop_cl = true;
 	}
+
+	/*
+	 * NPF-2161: For PF PMD. Will be overwritten for bifurcated mode when
+	 * port is mmapped
+	 */
+	if (port_data->use_ded_autopop_cl)
+		port_data->autopop_addr = port_data->pp_addr +
+			DLB2_NUM_BYTES_PER_CACHE_LINE;
+	else
+		port_data->autopop_addr = port_data->pp_addr;
+
+	qm_port->use_scalar = false;
 
 #if (!defined RTE_ARCH_X86_64)
 	qm_port->use_scalar = true;
 #else
 	if ((qm_port->cq_depth > 64) ||
 	    (!rte_is_power_of_2(qm_port->cq_depth)) ||
-	    (dlb2->vector_opts_enabled == false))
+	    (dlb2->vector_opts_disab == true))
 		qm_port->use_scalar = true;
 #endif
 
@@ -1970,8 +2452,9 @@ dlb2_eventdev_port_setup(struct rte_eventdev *dev,
 {
 	struct dlb2_eventdev *dlb2;
 	struct dlb2_eventdev_port *ev_port;
-	uint32_t hw_credit_quanta, sw_credit_quanta;
+	struct dlb2_hw_dev *handle;
 	int ret;
+	uint32_t hw_credit_quanta, sw_credit_quanta;
 
 	if (dev == NULL || port_conf == NULL) {
 		DLB2_LOG_ERR("Null parameter\n");
@@ -1979,14 +2462,15 @@ dlb2_eventdev_port_setup(struct rte_eventdev *dev,
 	}
 
 	dlb2 = dlb2_pmd_priv(dev);
+	handle = &dlb2->qm_instance;
 
 	if (ev_port_id >= DLB2_MAX_NUM_PORTS(dlb2->version))
 		return -EINVAL;
 
 	if (port_conf->dequeue_depth >
-		evdev_dlb2_default_info.max_event_port_dequeue_depth ||
+		handle->evdev_rsrcs.max_event_port_dequeue_depth ||
 	    port_conf->enqueue_depth >
-		evdev_dlb2_default_info.max_event_port_enqueue_depth)
+		handle->evdev_rsrcs.max_event_port_enqueue_depth)
 		return -EINVAL;
 
 	ev_port = &dlb2->ev_ports[ev_port_id];
@@ -1996,55 +2480,48 @@ dlb2_eventdev_port_setup(struct rte_eventdev *dev,
 		return -EINVAL;
 	}
 
-	/* Default for worker ports */
-	sw_credit_quanta = dlb2->sw_credit_quanta;
-	hw_credit_quanta = dlb2->hw_credit_quanta;
-
-	ev_port->qm_port.is_producer = false;
 	ev_port->qm_port.is_directed = port_conf->event_port_cfg &
 		RTE_EVENT_PORT_CFG_SINGLE_LINK;
-
-	if (port_conf->event_port_cfg & RTE_EVENT_PORT_CFG_HINT_PRODUCER) {
-		/* Producer type ports. Mostly enqueue */
-		sw_credit_quanta = DLB2_SW_CREDIT_P_QUANTA_DEFAULT;
-		hw_credit_quanta = DLB2_SW_CREDIT_P_BATCH_SZ;
-		ev_port->qm_port.is_producer = true;
-	}
-	if (port_conf->event_port_cfg & RTE_EVENT_PORT_CFG_HINT_CONSUMER) {
-		/* Consumer type ports. Mostly dequeue */
-		sw_credit_quanta = DLB2_SW_CREDIT_C_QUANTA_DEFAULT;
-		hw_credit_quanta = DLB2_SW_CREDIT_C_BATCH_SZ;
-	}
-	ev_port->credit_update_quanta = sw_credit_quanta;
-	ev_port->qm_port.hw_credit_quanta = hw_credit_quanta;
 
 	/*
 	 * Validate credit config before creating port
 	 */
 
-	if (port_conf->enqueue_depth > sw_credit_quanta ||
-	    port_conf->enqueue_depth > hw_credit_quanta) {
-		DLB2_LOG_ERR("Invalid port config. Enqueue depth %d must be <= credit quanta %d and batch size %d\n",
-			     port_conf->enqueue_depth,
-			     sw_credit_quanta,
-			     hw_credit_quanta);
-		return -EINVAL;
+	/* Default for worker ports */
+	sw_credit_quanta = dlb2->sw_credit_quanta[DLB2_CQ_WORKER_INDEX];
+	hw_credit_quanta = dlb2->hw_credit_quanta[DLB2_CQ_WORKER_INDEX];
+	ev_port->qm_port.is_producer = false;
+
+	if (port_conf->event_port_cfg & RTE_EVENT_PORT_CFG_HINT_PRODUCER) {
+		/* Producer type ports. Mostly enqueue */
+		sw_credit_quanta = dlb2->sw_credit_quanta[DLB2_CQ_PRODUCER_INDEX];
+		hw_credit_quanta = dlb2->hw_credit_quanta[DLB2_CQ_PRODUCER_INDEX];
+		ev_port->qm_port.is_producer = true;
 	}
-	ev_port->enq_retries = port_conf->enqueue_depth / sw_credit_quanta;
+	if (port_conf->event_port_cfg & RTE_EVENT_PORT_CFG_HINT_CONSUMER) {
+		/* Consumer type ports. Mostly dequeue */
+		sw_credit_quanta = dlb2->sw_credit_quanta[DLB2_CQ_CONSUMER_INDEX];
+		hw_credit_quanta = dlb2->hw_credit_quanta[DLB2_CQ_CONSUMER_INDEX];
+	}
+	ev_port->credit_update_quanta = sw_credit_quanta;
+	ev_port->qm_port.hw_credit_quanta = hw_credit_quanta;
 
-	/* Save off port config for reconfig */
-	ev_port->conf = *port_conf;
-
+	ev_port->enq_retries = port_conf->enqueue_depth; /* / sw_credit_quanta; */
+	ev_port->qm_port.reorder_id = 0;
+	ev_port->qm_port.reorder_en = port_conf->event_port_cfg &
+				      RTE_EVENT_PORT_CFG_RESTORE_DEQ_ORDER;
 
 	/*
 	 * Create port
 	 */
 
+	/* Save off port config for reconfig */
+	ev_port->conf = *port_conf;
+
 	if (!ev_port->qm_port.is_directed) {
 		ret = dlb2_hw_create_ldb_port(dlb2,
 					      ev_port,
-					      port_conf->dequeue_depth,
-					      port_conf->enqueue_depth);
+					      port_conf->dequeue_depth);
 		if (ret < 0) {
 			DLB2_LOG_ERR("Failed to create the lB port ve portId=%d\n",
 				     ev_port_id);
@@ -2065,6 +2542,7 @@ dlb2_eventdev_port_setup(struct rte_eventdev *dev,
 	ev_port->id = ev_port_id;
 	ev_port->enq_configured = true;
 	ev_port->setup_done = true;
+	ev_port->num_frags = 0;
 	ev_port->inflight_max = port_conf->new_event_threshold;
 	ev_port->implicit_release = !(port_conf->event_port_cfg &
 		  RTE_EVENT_PORT_CFG_DISABLE_IMPL_REL);
@@ -2072,35 +2550,11 @@ dlb2_eventdev_port_setup(struct rte_eventdev *dev,
 	ev_port->inflight_credits = 0;
 	ev_port->dlb2 = dlb2; /* reverse link */
 
-	/* Default for worker ports */
-	sw_credit_quanta = dlb2->sw_credit_quanta;
-	hw_credit_quanta = dlb2->hw_credit_quanta;
-
-	if (port_conf->event_port_cfg & RTE_EVENT_PORT_CFG_HINT_PRODUCER) {
-		/* Producer type ports. Mostly enqueue */
-		sw_credit_quanta = DLB2_SW_CREDIT_P_QUANTA_DEFAULT;
-		hw_credit_quanta = DLB2_SW_CREDIT_P_BATCH_SZ;
-	}
-	if (port_conf->event_port_cfg & RTE_EVENT_PORT_CFG_HINT_CONSUMER) {
-		/* Consumer type ports. Mostly dequeue */
-		sw_credit_quanta = DLB2_SW_CREDIT_C_QUANTA_DEFAULT;
-		hw_credit_quanta = DLB2_SW_CREDIT_C_BATCH_SZ;
-	}
-	ev_port->credit_update_quanta = sw_credit_quanta;
-	ev_port->qm_port.hw_credit_quanta = hw_credit_quanta;
-
-
 	/* Tear down pre-existing port->queue links */
 	if (dlb2->run_state == DLB2_RUN_STATE_STOPPED)
 		dlb2_port_link_teardown(dlb2, &dlb2->ev_ports[ev_port_id]);
 
 	dev->data->ports[ev_port_id] = &dlb2->ev_ports[ev_port_id];
-
-	if (rte_cpu_get_flag_enabled(RTE_CPUFLAG_AVX512VL) &&
-	    rte_vect_get_max_simd_bitwidth() >= RTE_VECT_SIMD_512)
-		ev_port->qm_port.use_avx512 = true;
-	else
-		ev_port->qm_port.use_avx512 = false;
 
 	return 0;
 }
@@ -2188,9 +2642,8 @@ dlb2_hw_create_dir_queue(struct dlb2_eventdev *dlb2,
 	cfg.port_id = qm_port_id;
 
 	if (ev_queue->depth_threshold == 0) {
-		cfg.depth_threshold = dlb2->default_depth_thresh;
-		ev_queue->depth_threshold =
-			dlb2->default_depth_thresh;
+		cfg.depth_threshold = RTE_PMD_DLB2_DEFAULT_DEPTH_THRESH;
+		ev_queue->depth_threshold = RTE_PMD_DLB2_DEFAULT_DEPTH_THRESH;
 	} else
 		cfg.depth_threshold = ev_queue->depth_threshold;
 
@@ -2447,7 +2900,7 @@ dlb2_event_queue_detach_ldb(struct dlb2_eventdev *dlb2,
 	}
 
 	/* This is expected with eventdev API!
-	 * It blindly attempts to unmap all queues.
+	 * It blindly attemmpts to unmap all queues.
 	 */
 	if (i == DLB2_MAX_NUM_QIDS_PER_LDB_CQ) {
 		DLB2_LOG_DBG("dlb2: ignoring LB QID %d not mapped for qm_port %d.\n",
@@ -2463,6 +2916,61 @@ dlb2_event_queue_detach_ldb(struct dlb2_eventdev *dlb2,
 		ev_port->link[i].mapped = false;
 
 	return ret;
+}
+
+static inline void
+dlb2_port_credits_return(struct dlb2_port *qm_port)
+{
+	/* Return all port credits */
+	if (qm_port->dlb2->version == DLB2_HW_V2_5) {
+		if (qm_port->cached_credits) {
+			__atomic_fetch_add(qm_port->credit_pool[DLB2_COMBINED_POOL],
+					   qm_port->cached_credits, __ATOMIC_SEQ_CST);
+			qm_port->cached_credits = 0;
+		}
+	} else {
+		if (qm_port->cached_ldb_credits) {
+			__atomic_fetch_add(qm_port->credit_pool[DLB2_LDB_QUEUE],
+					   qm_port->cached_ldb_credits, __ATOMIC_SEQ_CST);
+			qm_port->cached_ldb_credits = 0;
+		}
+		if (qm_port->cached_dir_credits) {
+			__atomic_fetch_add(qm_port->credit_pool[DLB2_DIR_QUEUE],
+					   qm_port->cached_dir_credits, __ATOMIC_SEQ_CST);
+			qm_port->cached_dir_credits = 0;
+		}
+	}
+}
+
+static inline void
+dlb2_release_sw_credits(struct dlb2_eventdev *dlb2,
+			struct dlb2_eventdev_port *ev_port, uint16_t val)
+{
+	if (ev_port->inflight_credits) {
+		__atomic_fetch_sub(&dlb2->inflights, val, __ATOMIC_SEQ_CST);
+		ev_port->inflight_credits -= val;
+	}
+}
+
+static void dlb2_check_and_return_credits(struct dlb2_eventdev_port *ev_port,
+					  bool cond, uint32_t threshold)
+{
+#if DLB_SW_CREDITS_CHECKS || DLB_HW_CREDITS_CHECKS
+	if (cond) {
+		if (++ev_port->credit_return_count > threshold) {
+#if DLB_SW_CREDITS_CHECKS
+			dlb2_release_sw_credits(ev_port->dlb2, ev_port,
+						ev_port->inflight_credits);
+#endif
+#if DLB_HW_CREDITS_CHECKS
+			dlb2_port_credits_return(&ev_port->qm_port);
+#endif
+			ev_port->credit_return_count = 0;
+		}
+	} else {
+		ev_port->credit_return_count = 0;
+	}
+#endif
 }
 
 static int
@@ -2484,14 +2992,15 @@ dlb2_eventdev_port_unlink(struct rte_eventdev *dev, void *event_port,
 
 	if (queues == NULL || nb_unlinks == 0) {
 		DLB2_LOG_DBG("dlb2: queues is NULL or nb_unlinks is 0\n");
-		return 0; /* Ignore and return success */
+		nb_unlinks = 0; /* Ignore and return success */
+		goto ret_credits;
 	}
 
 	if (ev_port->qm_port.is_directed) {
 		DLB2_LOG_DBG("dlb2: ignore unlink from dir port %d\n",
 			     ev_port->id);
 		rte_errno = 0;
-		return nb_unlinks; /* as if success */
+		goto ret_credits;
 	}
 
 	dlb2 = ev_port->dlb2;
@@ -2529,6 +3038,10 @@ dlb2_eventdev_port_unlink(struct rte_eventdev *dev, void *event_port,
 		ev_port->num_links--;
 		ev_queue->num_links--;
 	}
+
+ret_credits:
+	if (ev_port->inflight_credits)
+		dlb2_check_and_return_credits(ev_port, true, 0);
 
 	return nb_unlinks;
 }
@@ -2642,6 +3155,27 @@ dlb2_eventdev_apply_port_links(struct rte_eventdev *dev)
 }
 
 static int
+dlb2_set_port_ctrl(struct dlb2_eventdev_port *ev_port, bool enable)
+{
+	const char *err_str = enable ? "enabled" : "disabled";
+
+	if (!ev_port->setup_done)
+		return 0;
+
+	if (!(ev_port->enq_configured ^ enable)) {
+		DLB2_LOG_INFO("dlb2: ev_port %d already %s\n", ev_port->id, err_str);
+		return 0;
+	}
+	if (dlb2_iface_port_ctrl(&ev_port->qm_port, enable)) {
+		DLB2_LOG_ERR("dlb2: ev_port %d could not be %s\n", ev_port->id, err_str);
+		return -EFAULT;
+	}
+	ev_port->enq_configured = enable;
+
+	return 0;
+}
+
+static int
 dlb2_eventdev_start(struct rte_eventdev *dev)
 {
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
@@ -2672,10 +3206,14 @@ dlb2_eventdev_start(struct rte_eventdev *dev)
 		return ret;
 
 	for (i = 0; i < dlb2->num_ports; i++) {
-		if (!dlb2->ev_ports[i].setup_done) {
+		struct dlb2_eventdev_port *ev_port = &dlb2->ev_ports[i];
+
+		if (!ev_port->setup_done && ev_port->qm_port.config_state != DLB2_NOT_CONFIGURED) {
 			DLB2_LOG_ERR("dlb2: port %d not setup", i);
 			return -ESTALE;
 		}
+		if (dlb2_set_port_ctrl(ev_port, true))
+			return -EFAULT;
 	}
 
 	for (i = 0; i < dlb2->num_queues; i++) {
@@ -2698,12 +3236,28 @@ dlb2_eventdev_start(struct rte_eventdev *dev)
 	return 0;
 }
 
+static uint8_t cmd_byte_map[DLB2_NUM_PORT_TYPES][DLB2_NUM_HW_SCHED_TYPES] = {
+	{
+		/* Load-balanced cmd bytes */
+		[RTE_EVENT_OP_NEW] = DLB2_NEW_CMD_BYTE,
+		[RTE_EVENT_OP_FORWARD] = DLB2_FWD_CMD_BYTE,
+		[RTE_EVENT_OP_RELEASE] = DLB2_COMP_CMD_BYTE,
+		[RTE_EVENT_DLB2_OP_FRAG] = DLB2_FRAG_CMD_BYTE,
+	},
+	{
+		/* Directed cmd bytes */
+		[RTE_EVENT_OP_NEW] = DLB2_NEW_CMD_BYTE,
+		[RTE_EVENT_OP_FORWARD] = DLB2_NEW_CMD_BYTE,
+		[RTE_EVENT_OP_RELEASE] = DLB2_NOOP_CMD_BYTE,
+		[RTE_EVENT_DLB2_OP_FRAG] = DLB2_NEW_CMD_BYTE,
+	},
+};
+
 static inline uint32_t
 dlb2_port_credits_get(struct dlb2_port *qm_port,
 		      enum dlb2_hw_queue_types type)
 {
 	uint32_t credits = *qm_port->credit_pool[type];
-	/* By default hw_credit_quanta is DLB2_SW_CREDIT_BATCH_SZ */
 	uint32_t batch_size = qm_port->hw_credit_quanta;
 
 	if (unlikely(credits < batch_size))
@@ -2729,8 +3283,7 @@ dlb2_replenish_sw_credits(struct dlb2_eventdev *dlb2,
 		/* Replenish credits, saving one quanta for enqueues */
 		uint16_t val = ev_port->inflight_credits - quanta;
 
-		__atomic_fetch_sub(&dlb2->inflights, val, __ATOMIC_SEQ_CST);
-		ev_port->inflight_credits -= val;
+		dlb2_release_sw_credits(dlb2, ev_port, val);
 	}
 }
 
@@ -2742,11 +3295,13 @@ dlb2_check_enqueue_sw_credits(struct dlb2_eventdev *dlb2,
 						__ATOMIC_SEQ_CST);
 	const int num = 1;
 
+#if ENABLE_PORT_THRES_CHECK
 	if (unlikely(ev_port->inflight_max < sw_inflights)) {
 		DLB2_INC_STAT(ev_port->stats.traffic.tx_nospc_inflight_max, 1);
 		rte_errno = -ENOSPC;
 		return 1;
 	}
+#endif
 
 	if (ev_port->inflight_credits < num) {
 		/* check if event enqueue brings ev_port over max threshold */
@@ -2760,10 +3315,14 @@ dlb2_check_enqueue_sw_credits(struct dlb2_eventdev *dlb2,
 			rte_errno = -ENOSPC;
 			return 1;
 		}
-
-		__atomic_fetch_add(&dlb2->inflights, credit_update_quanta,
-				   __ATOMIC_SEQ_CST);
-		ev_port->inflight_credits += (credit_update_quanta);
+		/* Application will retry if this attempt fails due to contention */
+		if(__atomic_compare_exchange_n(&dlb2->inflights, &sw_inflights, (sw_inflights+credit_update_quanta), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) )
+			ev_port->inflight_credits += (credit_update_quanta);
+		else
+		{
+			rte_errno = -ENOSPC;
+			return 1;
+		}
 
 		if (ev_port->inflight_credits < num) {
 			DLB2_INC_STAT(
@@ -2834,10 +3393,35 @@ dlb2_check_enqueue_hw_credits(struct dlb2_port *qm_port)
 }
 
 static __rte_always_inline void
-dlb2_pp_write(struct dlb2_enqueue_qe *qe4,
-	      struct process_local_port_data *port_data)
+dlb2_pp_write(struct process_local_port_data *port_data,
+	      struct dlb2_enqueue_qe *qe4)
 {
-	dlb2_movdir64b(port_data->pp_addr, qe4);
+	qm_mmio_fns.pp_enqueue_four(port_data->pp_addr, qe4);
+}
+
+static __rte_always_inline void
+dlb2_pp_write_reorder(struct process_local_port_data *port_data,
+	      struct dlb2_enqueue_qe *qe4)
+{
+	for (uint8_t i = 0; i < 4; i++) {
+		if (qe4[i].cmd_byte != DLB2_NOOP_CMD_BYTE) {
+			qm_mmio_fns.pp_enqueue_four(port_data->pp_addr, qe4);
+			return;
+		}
+	}
+}
+
+static __rte_always_inline int
+dlb2_pp_check4_write(struct process_local_port_data *port_data,
+	      struct dlb2_enqueue_qe *qe4)
+{
+	for (uint8_t i = 0; i < DLB2_NUM_QES_PER_CACHE_LINE; i++)
+		if (((uint64_t *)&qe4[i])[1] == 0)
+			return 0;
+	
+	qm_mmio_fns.pp_enqueue_four(port_data->pp_addr, qe4);
+	memset(qe4, 0 , DLB2_NUM_QES_PER_CACHE_LINE * sizeof(struct dlb2_enqueue_qe));
+	return DLB2_NUM_QES_PER_CACHE_LINE;
 }
 
 static inline int
@@ -2855,9 +3439,14 @@ dlb2_consume_qe_immediate(struct dlb2_port *qm_port, int num)
 	/* No store fence needed since no pointer is being sent, and CQ token
 	 * pops can be safely reordered with other HCWs.
 	 */
-	port_data = &dlb2_port[qm_port->id][PORT_TYPE(qm_port)];
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
 
-	dlb2_movntdq_single(port_data->pp_addr, qe);
+#if USE_MOVDIR64B_SINGLE
+	dlb2_movdir64b_single(port_data->autopop_addr, qe);
+#else
+	dlb2_movntdq_single(port_data->autopop_addr, qe);
+#endif
 
 	DLB2_LOG_DBG("dlb2: consume immediate - %d QEs\n", num);
 
@@ -2877,7 +3466,7 @@ dlb2_hw_do_enqueue(struct dlb2_port *qm_port,
 	if (do_sfence)
 		rte_wmb();
 
-	dlb2_pp_write(qm_port->qe4, port_data);
+	dlb2_pp_write(port_data, (struct dlb2_enqueue_qe *)qm_port->qe4);
 }
 
 static inline void
@@ -2892,6 +3481,239 @@ dlb2_construct_token_pop_qe(struct dlb2_port *qm_port, int idx)
 	qm_port->owed_tokens = 0;
 }
 
+static inline void
+dlb2_event_build_hcws(struct dlb2_port *qm_port,
+		      const struct rte_event ev[],
+		      int num,
+		      uint8_t *sched_type,
+		      uint8_t *queue_id)
+{
+	struct dlb2_enqueue_qe *qe;
+	uint16_t sched_word[4];
+	__m128i sse_qe[2];
+	int i;
+
+	qe = qm_port->qe4;
+
+	sse_qe[0] = _mm_setzero_si128();
+	sse_qe[1] = _mm_setzero_si128();
+
+	switch (num) {
+	case 4:
+		/* Construct the metadata portion of two HCWs in one 128b SSE
+		 * register. HCW metadata is constructed in the SSE registers
+		 * like so:
+		 * sse_qe[0][63:0]:   qe[0]'s metadata
+		 * sse_qe[0][127:64]: qe[1]'s metadata
+		 * sse_qe[1][63:0]:   qe[2]'s metadata
+		 * sse_qe[1][127:64]: qe[3]'s metadata
+		 */
+
+		/* Convert the event operation into a command byte and store it
+		 * in the metadata:
+		 * sse_qe[0][63:56]   = cmd_byte_map[is_directed][ev[0].op]
+		 * sse_qe[0][127:120] = cmd_byte_map[is_directed][ev[1].op]
+		 * sse_qe[1][63:56]   = cmd_byte_map[is_directed][ev[2].op]
+		 * sse_qe[1][127:120] = cmd_byte_map[is_directed][ev[3].op]
+		 */
+#define DLB2_QE_CMD_BYTE 7
+		sse_qe[0] = _mm_insert_epi8(sse_qe[0],
+				cmd_byte_map[qm_port->is_directed][ev[0].op],
+				DLB2_QE_CMD_BYTE);
+		sse_qe[0] = _mm_insert_epi8(sse_qe[0],
+				cmd_byte_map[qm_port->is_directed][ev[1].op],
+				DLB2_QE_CMD_BYTE + 8);
+		sse_qe[1] = _mm_insert_epi8(sse_qe[1],
+				cmd_byte_map[qm_port->is_directed][ev[2].op],
+				DLB2_QE_CMD_BYTE);
+		sse_qe[1] = _mm_insert_epi8(sse_qe[1],
+				cmd_byte_map[qm_port->is_directed][ev[3].op],
+				DLB2_QE_CMD_BYTE + 8);
+
+		/* Store priority, scheduling type, and queue ID in the sched
+		 * word array because these values are re-used when the
+		 * destination is a directed queue.
+		 */
+		sched_word[0] = EV_TO_DLB2_PRIO(ev[0].priority) << 10 |
+				sched_type[0] << 8 |
+				queue_id[0];
+		sched_word[1] = EV_TO_DLB2_PRIO(ev[1].priority) << 10 |
+				sched_type[1] << 8 |
+				queue_id[1];
+		sched_word[2] = EV_TO_DLB2_PRIO(ev[2].priority) << 10 |
+				sched_type[2] << 8 |
+				queue_id[2];
+		sched_word[3] = EV_TO_DLB2_PRIO(ev[3].priority) << 10 |
+				sched_type[3] << 8 |
+				queue_id[3];
+
+		/* Store the event priority, scheduling type, and queue ID in
+		 * the metadata:
+		 * sse_qe[0][31:16] = sched_word[0]
+		 * sse_qe[0][95:80] = sched_word[1]
+		 * sse_qe[1][31:16] = sched_word[2]
+		 * sse_qe[1][95:80] = sched_word[3]
+		 */
+#define DLB2_QE_QID_SCHED_WORD 1
+		sse_qe[0] = _mm_insert_epi16(sse_qe[0],
+					     sched_word[0],
+					     DLB2_QE_QID_SCHED_WORD);
+		sse_qe[0] = _mm_insert_epi16(sse_qe[0],
+					     sched_word[1],
+					     DLB2_QE_QID_SCHED_WORD + 4);
+		sse_qe[1] = _mm_insert_epi16(sse_qe[1],
+					     sched_word[2],
+					     DLB2_QE_QID_SCHED_WORD);
+		sse_qe[1] = _mm_insert_epi16(sse_qe[1],
+					     sched_word[3],
+					     DLB2_QE_QID_SCHED_WORD + 4);
+
+		/* If the destination is a load-balanced queue, store the lock
+		 * ID. If it is a directed queue, DLB places this field in
+		 * bytes 10-11 of the received QE, so we format it accordingly:
+		 * sse_qe[0][47:32]  = dir queue ? sched_word[0] : flow_id[0]
+		 * sse_qe[0][111:96] = dir queue ? sched_word[1] : flow_id[1]
+		 * sse_qe[1][47:32]  = dir queue ? sched_word[2] : flow_id[2]
+		 * sse_qe[1][111:96] = dir queue ? sched_word[3] : flow_id[3]
+		 */
+#define DLB2_QE_LOCK_ID_WORD 2
+		sse_qe[0] = _mm_insert_epi16(sse_qe[0],
+				(sched_type[0] == DLB2_SCHED_DIRECTED) ?
+					sched_word[0] : ev[0].flow_id,
+				DLB2_QE_LOCK_ID_WORD);
+		sse_qe[0] = _mm_insert_epi16(sse_qe[0],
+				(sched_type[1] == DLB2_SCHED_DIRECTED) ?
+					sched_word[1] : ev[1].flow_id,
+				DLB2_QE_LOCK_ID_WORD + 4);
+		sse_qe[1] = _mm_insert_epi16(sse_qe[1],
+				(sched_type[2] == DLB2_SCHED_DIRECTED) ?
+					sched_word[2] : ev[2].flow_id,
+				DLB2_QE_LOCK_ID_WORD);
+		sse_qe[1] = _mm_insert_epi16(sse_qe[1],
+				(sched_type[3] == DLB2_SCHED_DIRECTED) ?
+					sched_word[3] : ev[3].flow_id,
+				DLB2_QE_LOCK_ID_WORD + 4);
+
+		/* Store the event type and sub event type in the metadata:
+		 * sse_qe[0][15:0]  = flow_id[0]
+		 * sse_qe[0][79:64] = flow_id[1]
+		 * sse_qe[1][15:0]  = flow_id[2]
+		 * sse_qe[1][79:64] = flow_id[3]
+		 */
+#define DLB2_QE_EV_TYPE_WORD 0
+		sse_qe[0] = _mm_insert_epi16(sse_qe[0],
+					     ev[0].sub_event_type << 4 |
+						ev[0].event_type << 12,
+					     DLB2_QE_EV_TYPE_WORD);
+		sse_qe[0] = _mm_insert_epi16(sse_qe[0],
+					     ev[1].sub_event_type << 4 |
+						ev[1].event_type << 12,
+					     DLB2_QE_EV_TYPE_WORD + 4);
+		sse_qe[1] = _mm_insert_epi16(sse_qe[1],
+					     ev[2].sub_event_type << 4 |
+						ev[2].event_type << 12,
+					     DLB2_QE_EV_TYPE_WORD);
+		sse_qe[1] = _mm_insert_epi16(sse_qe[1],
+					     ev[3].sub_event_type << 4 |
+						ev[3].event_type << 12,
+					     DLB2_QE_EV_TYPE_WORD + 4);
+#ifdef __AVX512VL__
+    /*
+    1) Build avx512 QE store and build each QE individualy as XMM register
+    2) Merge the 4 XMM registers/QEs into single AVX512 register
+    3) Store single avx512 register to &qe[0] (4x QEs stored in 1x store)
+    */
+
+      __m128i v_qe0 = _mm_setzero_si128();
+      uint64_t meta = _mm_extract_epi64(sse_qe[0], 0);
+      v_qe0 = _mm_insert_epi64(v_qe0, ev[0].u64, 0);
+      v_qe0 = _mm_insert_epi64(v_qe0, meta, 1);
+
+      __m128i v_qe1 = _mm_setzero_si128();
+      meta = _mm_extract_epi64(sse_qe[0], 1);
+      v_qe1 = _mm_insert_epi64(v_qe1, ev[1].u64, 0);
+      v_qe1 = _mm_insert_epi64(v_qe1, meta, 1);
+
+     __m128i v_qe2 = _mm_setzero_si128();
+      meta = _mm_extract_epi64(sse_qe[1], 0);
+      v_qe2 = _mm_insert_epi64(v_qe2, ev[2].u64, 0);
+      v_qe2 = _mm_insert_epi64(v_qe2, meta, 1);
+
+      __m128i v_qe3 = _mm_setzero_si128();
+      meta = _mm_extract_epi64(sse_qe[1], 1);
+      v_qe3 = _mm_insert_epi64(v_qe3, ev[3].u64, 0);
+      v_qe3 = _mm_insert_epi64(v_qe3, meta, 1);
+
+      /* we have 4x XMM registers, one per QE. */
+      __m512i v_all_qes = _mm512_setzero_si512();
+      v_all_qes = _mm512_inserti32x4 (v_all_qes, v_qe0, 0);
+      v_all_qes = _mm512_inserti32x4 (v_all_qes, v_qe1, 1);
+      v_all_qes = _mm512_inserti32x4 (v_all_qes, v_qe2, 2);
+      v_all_qes = _mm512_inserti32x4 (v_all_qes, v_qe3, 3);
+
+     /* store the 4x QEs in a single register to the scratch space of the PMD */
+      _mm512_store_si512(&qe[0], v_all_qes);
+#else
+		/* Store the metadata to memory (use the double-precision
+		 * _mm_storeh_pd because there is no integer function for
+		 * storing the upper 64b):
+		 * qe[0] metadata = sse_qe[0][63:0]
+		 * qe[1] metadata = sse_qe[0][127:64]
+		 * qe[2] metadata = sse_qe[1][63:0]
+		 * qe[3] metadata = sse_qe[1][127:64]
+		 */
+		_mm_storel_epi64((__m128i *)&qe[0].u.opaque_data, sse_qe[0]);
+		_mm_storeh_pd((double *)&qe[1].u.opaque_data,
+			      (__m128d)sse_qe[0]);
+		_mm_storel_epi64((__m128i *)&qe[2].u.opaque_data, sse_qe[1]);
+		_mm_storeh_pd((double *)&qe[3].u.opaque_data,
+			      (__m128d)sse_qe[1]);
+
+		qe[0].data = ev[0].u64;
+		qe[1].data = ev[1].u64;
+		qe[2].data = ev[2].u64;
+		qe[3].data = ev[3].u64;
+
+#endif
+		/* will only be set for DLB 2.5 + */
+		if (qm_port->dlb2->enable_cq_weight) {
+			qe[0].weight = DLB2_GET_QE_WEIGHT(&ev[0]);
+			qe[1].weight = DLB2_GET_QE_WEIGHT(&ev[1]);
+			qe[2].weight = DLB2_GET_QE_WEIGHT(&ev[2]);
+			qe[3].weight = DLB2_GET_QE_WEIGHT(&ev[3]);
+		}
+
+		break;
+	case 3:
+	case 2:
+	case 1:
+		for (i = 0; i < num; i++) {
+			qe[i].cmd_byte =
+				cmd_byte_map[qm_port->is_directed][ev[i].op];
+			qe[i].sched_type = sched_type[i];
+			qe[i].data = ev[i].u64;
+			qe[i].qid = queue_id[i];
+			qe[i].priority = EV_TO_DLB2_PRIO(ev[i].priority);
+			qe[i].lock_id = ev[i].flow_id;
+			if (sched_type[i] == DLB2_SCHED_DIRECTED) {
+				struct dlb2_msg_info *info =
+					(struct dlb2_msg_info *)&qe[i].lock_id;
+
+				info->qid = queue_id[i];
+				info->sched_type = DLB2_SCHED_DIRECTED;
+				info->priority = qe[i].priority;
+			}
+			qe[i].u.event_type.major = ev[i].event_type;
+			qe[i].u.event_type.sub = ev[i].sub_event_type;
+			qe[i].weight = DLB2_GET_QE_WEIGHT(&ev[i]);
+		}
+		break;
+	case 0:
+		break;
+	}
+}
+
+
 static inline int
 dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 			struct dlb2_port *qm_port,
@@ -2901,7 +3723,9 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 {
 	struct dlb2_eventdev *dlb2 = ev_port->dlb2;
 	struct dlb2_eventdev_queue *ev_queue;
+#if DLB_HW_CREDITS_CHECKS
 	uint16_t *cached_credits = NULL;
+#endif
 	struct dlb2_queue *qm_queue;
 
 	ev_queue = &dlb2->ev_queues[ev->queue_id];
@@ -2913,6 +3737,7 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 		goto op_check;
 
 	if (!qm_queue->is_directed) {
+#if DLB_HW_CREDITS_CHECKS
 		/* Load balanced destination queue */
 
 		if (dlb2->version == DLB2_HW_V2) {
@@ -2928,6 +3753,8 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 			}
 			cached_credits = &qm_port->cached_credits;
 		}
+#endif
+#if DLB_TYPE_CHECK
 		switch (ev->sched_type) {
 		case RTE_SCHED_TYPE_ORDERED:
 			DLB2_LOG_DBG("dlb2: put_qe: RTE_SCHED_TYPE_ORDERED\n");
@@ -2941,13 +3768,15 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 			break;
 		case RTE_SCHED_TYPE_ATOMIC:
 			DLB2_LOG_DBG("dlb2: put_qe: RTE_SCHED_TYPE_ATOMIC\n");
+			/* No check as Atomic events are allowed on any queue type */
 			*sched_type = DLB2_SCHED_ATOMIC;
 			break;
 		case RTE_SCHED_TYPE_PARALLEL:
 			DLB2_LOG_DBG("dlb2: put_qe: RTE_SCHED_TYPE_PARALLEL\n");
-			if (qm_queue->sched_type == RTE_SCHED_TYPE_ORDERED)
+			/* Allow Parallel events on ordered queue to support CFG_ALL_TYPEs */
+			if (qm_queue->sched_type == RTE_SCHED_TYPE_ORDERED) 
 				*sched_type = DLB2_SCHED_ORDERED;
-			else
+		  else	
 				*sched_type = DLB2_SCHED_UNORDERED;
 			break;
 		default:
@@ -2956,9 +3785,20 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 			rte_errno = -EINVAL;
 			return 1;
 		}
+#else
+#if (RTE_SCHED_TYPE_PARALLEL != 2) || (RTE_SCHED_TYPE_ATOMIC != 1)
+#error "ERROR: RTE event schedule type values changed. Needs a code change"
+#endif
+		/* Map RTE eventdev schedule type to DLB HW schedule type */
+		if (qm_queue->sched_type != RTE_SCHED_TYPE_ORDERED)
+			/* RTE-Parallel -> DLB-UnOrd 2->1, RTE-Atm -> DLB-Atm 1->0 */
+			*sched_type = ev->sched_type - 1;
+		else /* To support CFG_ALL_TYPEs */
+			*sched_type = DLB2_SCHED_ORDERED; /* RTE-Ord -> DLB-Ord 0->2 */
+#endif
 	} else {
 		/* Directed destination queue */
-
+#if DLB_HW_CREDITS_CHECKS
 		if (dlb2->version == DLB2_HW_V2) {
 			if (dlb2_check_enqueue_hw_dir_credits(qm_port)) {
 				rte_errno = -ENOSPC;
@@ -2972,6 +3812,7 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 			}
 			cached_credits = &qm_port->cached_credits;
 		}
+#endif
 		DLB2_LOG_DBG("dlb2: put_qe: RTE_SCHED_TYPE_DIRECTED\n");
 
 		*sched_type = DLB2_SCHED_DIRECTED;
@@ -2980,13 +3821,17 @@ dlb2_event_enqueue_prep(struct dlb2_eventdev_port *ev_port,
 op_check:
 	switch (ev->op) {
 	case RTE_EVENT_OP_NEW:
+#if DLB_SW_CREDITS_CHECKS
 		/* Check that a sw credit is available */
 		if (dlb2_check_enqueue_sw_credits(dlb2, ev_port)) {
 			rte_errno = -ENOSPC;
 			return 1;
 		}
 		ev_port->inflight_credits--;
+#endif
+#if DLB_HW_CREDITS_CHECKS
 		(*cached_credits)--;
+#endif
 		break;
 	case RTE_EVENT_OP_FORWARD:
 		/* Check for outstanding_releases underflow. If this occurs,
@@ -2995,12 +3840,24 @@ op_check:
 		 * dequeued.
 		 */
 		RTE_ASSERT(ev_port->outstanding_releases > 0);
+		if (unlikely(ev_port->num_frags == DLB2_MAX_FRAGS)) {
+			if (!qm_port->reorder_en && dlb2->version == DLB2_HW_V2_5) {
+				rte_errno = -EINVAL;
+				DLB2_LOG_ERR("dlb2: >16 frags/port\n");
+				return 1;
+			}
+		}
 		ev_port->outstanding_releases--;
+		ev_port->num_frags = 0;
 		qm_port->issued_releases++;
+#if DLB_HW_CREDITS_CHECKS
 		(*cached_credits)--;
+#endif
 		break;
 	case RTE_EVENT_OP_RELEASE:
+#if DLB_SW_CREDITS_CHECKS
 		ev_port->inflight_credits++;
+#endif
 		/* Check for outstanding_releases underflow. If this occurs,
 		 * the application is not using the EVENT_OPs correctly; for
 		 * example, forwarding or releasing events that were not
@@ -3008,17 +3865,48 @@ op_check:
 		 */
 		RTE_ASSERT(ev_port->outstanding_releases > 0);
 		ev_port->outstanding_releases--;
+		ev_port->num_frags = 0;
 		qm_port->issued_releases++;
 
+#if DLB_SW_CREDITS_CHECKS
 		/* Replenish s/w credits if enough are cached */
 		dlb2_replenish_sw_credits(dlb2, ev_port);
+#endif
+		break;
+	/* Fragments not supported in the API, but left here for
+	 * possible future use.
+	 */
+	case RTE_EVENT_DLB2_OP_FRAG:
+		/* not supported in 2.0 */
+		RTE_ASSERT(dlb2->version == DLB2_HW_V2_5);
+#if DLB_SW_CREDITS_CHECKS
+		/* Check that a sw credit is available */
+		if (dlb2_check_enqueue_sw_credits(dlb2, ev_port)) {
+			rte_errno = -ENOSPC;
+			return 1;
+		}
+#endif
+		if (unlikely(ev_port->num_frags == DLB2_MAX_FRAGS)) {
+			if (likely(!qm_port->reorder_en)){
+				rte_errno = -EINVAL;
+				DLB2_LOG_ERR("dlb2: >16 frags/port\n");
+				return 1;
+			}
+		}
+#if DLB_SW_CREDITS_CHECKS
+		ev_port->inflight_credits--;
+#endif
+		ev_port->num_frags++;
+#if DLB_HW_CREDITS_CHECKS
+		(*cached_credits)--;
+#endif
 		break;
 	}
 
 	DLB2_INC_STAT(ev_port->stats.tx_op_cnt[ev->op], 1);
 	DLB2_INC_STAT(ev_port->stats.traffic.tx_ok, 1);
 
-#ifndef RTE_LIBRTE_PMD_DLB_QUELL_STATS
+#ifndef RTE_LIBRTE_PMD_DLB2_QUELL_STATS
 	if (ev->op != RTE_EVENT_OP_RELEASE) {
 		DLB2_INC_STAT(ev_port->stats.queue[ev->queue_id].enq_ok, 1);
 		DLB2_INC_STAT(ev_port->stats.tx_sched_cnt[*sched_type], 1);
@@ -3026,6 +3914,197 @@ op_check:
 #endif
 
 	return 0;
+}
+
+static inline __m128i
+dlb2_event_to_qe(const struct rte_event *ev, uint8_t cmd, uint8_t sched_type, uint8_t qid)
+{
+	__m128i dlb2_to_qe_shuffle = _mm_set_epi8(
+	    0xFF, 0xFF,			 /* zero out cmd word */
+	    1, 0,			 /* low 16-bits of flow id */
+	    0xFF, 0xFF, /* zero QID, sched_type etc fields to be filled later */
+	    3, 2,			 /* top of flow id, event type and subtype */
+	    15, 14, 13, 12, 11, 10, 9, 8 /* data from end of event goes at start */
+	);
+
+	/* event may not be 16 byte aligned. Use 16 byte unaligned load */
+	__m128i tmp = _mm_lddqu_si128((const __m128i *)ev);
+	__m128i qe = _mm_shuffle_epi8(tmp, dlb2_to_qe_shuffle);
+	struct dlb2_enqueue_qe *dq = (struct dlb2_enqueue_qe *)&qe;
+	/* set the cmd field */
+	qe = _mm_insert_epi8(qe, cmd, 15);
+	/* insert missing 16-bits with qid, sched_type and priority */
+	uint16_t qid_stype_prio =
+	    qid | (uint16_t)sched_type << 8 | ((uint16_t)ev->priority & 0xE0) << 5;
+	qe = _mm_insert_epi16(qe, qid_stype_prio, 5);
+	dq->weight = DLB2_GET_QE_WEIGHT(ev);
+	return qe;
+}
+
+static inline uint16_t
+__dlb2_event_enqueue_burst_reorder(void *event_port,
+		const struct rte_event events[],
+		uint16_t num,
+		bool use_delayed)
+{
+	struct dlb2_eventdev_port *ev_port = event_port;
+	struct dlb2_port *qm_port = &ev_port->qm_port;
+	struct dlb2_reorder *order = qm_port->order;
+	struct process_local_port_data *port_data;
+	bool is_directed = qm_port->is_directed;
+	uint8_t n = order->next_to_enqueue;
+	int retries = ev_port->enq_retries;
+	uint8_t frag = 0, p_cnt = 0;
+	__m128i new_qes[4], *from;
+	int num_new = 0;
+	int num_tx;
+	int i;
+
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
+	if (!port_data->mmaped)
+		dlb2_iface_port_mmap(qm_port);
+
+	num_tx = RTE_MIN(num, ev_port->conf.enqueue_depth);
+#if DLB2_BYPASS_FENCE_ON_PP == 1
+	if (!qm_port->is_producer) /* Call memory fense once at the start */
+		rte_wmb();	   /*  calls _mm_sfence() */
+#else
+	rte_wmb(); /*  calls _mm_sfence() */
+#endif
+	for (i = 0; i < num_tx; i++) {
+		uint8_t sched_type = 0;
+		uint8_t reorder_idx = events[i].impl_opaque;
+		int16_t thresh = qm_port->token_pop_thresh;
+		uint8_t qid = 0;
+		int ret;
+
+		while ((ret = dlb2_event_enqueue_prep(ev_port, qm_port, &events[i],
+						      &sched_type, &qid)) != 0 &&
+		       rte_errno == -ENOSPC && --retries > 0)
+			rte_pause();
+
+		if (ret != 0) /* Either there is error or retires exceeded */
+			break;
+
+		switch (events[i].op) {
+		case RTE_EVENT_OP_NEW:
+			new_qes[num_new++] = dlb2_event_to_qe(
+			    &events[i], DLB2_NEW_CMD_BYTE, sched_type, qid);
+			if (num_new == RTE_DIM(new_qes)) {
+				dlb2_pp_write(port_data, (struct dlb2_enqueue_qe *)&new_qes);
+				num_new = 0;
+			}
+			break;
+		case RTE_EVENT_OP_FORWARD: {
+			order->enq_reorder[reorder_idx].m128 = dlb2_event_to_qe(
+			    &events[i], is_directed ? DLB2_NEW_CMD_BYTE : DLB2_FWD_CMD_BYTE,
+			    sched_type, qid);
+			if (!order->pending_frags)
+				n += dlb2_pp_check4_write(port_data, &order->enq_reorder[n].qe);
+			break;
+		}
+		case RTE_EVENT_DLB2_OP_FRAG: {
+			uint8_t frag_index = order->frag_reorder[reorder_idx].num_frags++;
+
+			if (unlikely(frag_index >= DLB2_MAX_FRAGS - 1)) {
+				rte_errno = -EINVAL;
+				DLB2_LOG_ERR("dlb2: >16 frags/event\n");
+				printf("dlb2: >16 frags/event\n");
+				break;
+			}
+			order->frag_reorder[reorder_idx].enq[frag_index].m128 = dlb2_event_to_qe(
+			    &events[i], DLB2_FRAG_CMD_BYTE, sched_type, qid);
+			order->pending_frags++;
+			break;
+		}
+		case RTE_EVENT_OP_RELEASE: {
+			order->enq_reorder[reorder_idx].m128 = dlb2_event_to_qe(
+			    &events[i], is_directed ? DLB2_NOOP_CMD_BYTE : DLB2_COMP_CMD_BYTE,
+			    sched_type, 0xFF);
+			break;
+		}
+		}
+
+		if (use_delayed && qm_port->token_pop_mode == DELAYED_POP &&
+		    (events[i].op == RTE_EVENT_OP_FORWARD ||
+		     events[i].op == RTE_EVENT_OP_RELEASE) &&
+		    qm_port->issued_releases >= thresh - 1) {
+
+			dlb2_consume_qe_immediate(qm_port, qm_port->owed_tokens);
+
+			/* Reset the releases for the next QE batch */
+			qm_port->issued_releases -= thresh;
+
+			/* When using delayed token pop mode, the
+			 * initial token threshold is the full CQ
+			 * depth. After the first token pop, we need to
+			 * reset it to the dequeue_depth.
+			 */
+			qm_port->token_pop_thresh =
+			    qm_port->dequeue_depth;
+		}
+	}
+	while (order->enq_reorder[n].u64[1] != 0) {
+		bool p_frags = !!order->pending_frags;
+		__m128i tmp[4] = {0}, *send;
+
+		if (!p_frags || !order->frag_reorder[n].num_frags) {
+			bool enq;
+			if (!p_cnt)
+				from = &order->enq_reorder[n].m128;
+			frag = 0;
+			p_cnt++;
+			n++;
+			/* Send current accumulated events if any of these is true:
+			 *  - going to wraparound
+			 *  - 4 consecutive events have been accumulated
+			 *  - last event
+			 *  - if frags are pending and next event has frags
+			 */
+			enq = !n || p_cnt == 4 || !order->enq_reorder[n].u64[1] ||
+			      (p_frags && order->frag_reorder[n].num_frags);
+			if (!enq)
+				continue;
+		} else {
+			p_cnt = RTE_MIN(order->frag_reorder[n].num_frags, 4);
+			from = &order->frag_reorder[n].enq[frag].m128;
+			frag += p_cnt;
+			order->frag_reorder[n].num_frags -= p_cnt;
+			order->pending_frags -= p_cnt;
+		}
+
+		if (p_cnt < 4) {
+			memcpy(tmp, from, p_cnt * sizeof(struct dlb2_enqueue_qe));
+			send = tmp;
+		} else {
+			send  = from;
+		}
+		if (is_directed)
+			dlb2_pp_write_reorder(port_data, (struct dlb2_enqueue_qe *)send);
+		else
+			dlb2_pp_write(port_data, (struct dlb2_enqueue_qe *)send);
+		memset(from, 0, p_cnt * sizeof(struct dlb2_enqueue_qe));
+		p_cnt = 0;
+	}
+	order->next_to_enqueue = n;
+
+	if (num_new > 0) {
+		switch (num_new) {
+		case 1:
+			new_qes[1] = _mm_setzero_si128(); /* fall-through */
+		case 2:
+			new_qes[2] = _mm_setzero_si128(); /* fall-through */
+		case 3:
+			new_qes[3] = _mm_setzero_si128();
+		}
+		dlb2_pp_write(port_data, (struct dlb2_enqueue_qe *)&new_qes);
+		num_new = 0;
+	}
+
+	dlb2_check_and_return_credits(ev_port, !i, DLB2_ENQ_FAIL_CREDIT_RETURN_THRES);
+	return i;
 }
 
 static inline uint16_t
@@ -3044,9 +4123,17 @@ __dlb2_event_enqueue_burst(void *event_port,
 	RTE_ASSERT(ev_port->enq_configured);
 	RTE_ASSERT(events != NULL);
 
+	if (qm_port->reorder_en)
+		return __dlb2_event_enqueue_burst_reorder(event_port, events, num, use_delayed);
+
 	i = 0;
 
-	port_data = &dlb2_port[qm_port->id][PORT_TYPE(qm_port)];
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
+	if (!port_data->mmaped)
+		dlb2_iface_port_mmap(qm_port);
+
 	num_tx = RTE_MIN(num, ev_port->conf.enqueue_depth);
 	while (i < num_tx) {
 		uint8_t sched_types[DLB2_NUM_QES_PER_CACHE_LINE];
@@ -3079,6 +4166,14 @@ __dlb2_event_enqueue_burst(void *event_port,
 				/* Reset the releases for the next QE batch */
 				qm_port->issued_releases -= thresh;
 
+				/* When using delayed token pop mode, the
+				 * initial token threshold is the full CQ
+				 * depth. After the first token pop, we need to
+				 * reset it to the dequeue_depth.
+				 */
+				qm_port->token_pop_thresh =
+					qm_port->dequeue_depth;
+
 				pop_offs = 1;
 				j++;
 				break;
@@ -3104,12 +4199,11 @@ __dlb2_event_enqueue_burst(void *event_port,
 
 		dlb2_event_build_hcws(qm_port, &events[i], j - pop_offs,
 				      sched_types, queue_ids);
-
 #if DLB2_BYPASS_FENCE_ON_PP == 1
-		/* Bypass fence instruction for producer ports */
-		dlb2_hw_do_enqueue(qm_port, i == 0 && !qm_port->is_producer, port_data);
+                /* Bypass fence instruction for producer ports */
+                dlb2_hw_do_enqueue(qm_port, i == 0 && !qm_port->is_producer, port_data);
 #else
-		dlb2_hw_do_enqueue(qm_port, i == 0, port_data);
+                dlb2_hw_do_enqueue(qm_port, i == 0, port_data);
 #endif
 
 		/* Don't include the token pop QE in the enqueue count */
@@ -3122,6 +4216,8 @@ __dlb2_event_enqueue_burst(void *event_port,
 			break;
 	}
 
+	dlb2_check_and_return_credits(ev_port, !i,
+				      DLB2_ENQ_FAIL_CREDIT_RETURN_THRES);
 	return i;
 }
 
@@ -3206,7 +4302,8 @@ dlb2_event_release(struct dlb2_eventdev *dlb2,
 
 	ev_port = &dlb2->ev_ports[port_id];
 	qm_port = &ev_port->qm_port;
-	port_data = &dlb2_port[qm_port->id][PORT_TYPE(qm_port)];
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
 
 	i = 0;
 
@@ -3225,7 +4322,6 @@ dlb2_event_release(struct dlb2_eventdev *dlb2,
 		_mm_storeu_si128((void *)&qm_port->qe4[2], _mm_setzero_si128());
 		_mm_storeu_si128((void *)&qm_port->qe4[3], _mm_setzero_si128());
 
-
 		for (; j < DLB2_NUM_QES_PER_CACHE_LINE && (i + j) < n; j++) {
 			int16_t thresh = qm_port->token_pop_thresh;
 
@@ -3236,6 +4332,14 @@ dlb2_event_release(struct dlb2_eventdev *dlb2,
 
 				/* Reset the releases for the next QE batch */
 				qm_port->issued_releases -= thresh;
+
+				/* When using delayed token pop mode, the
+				 * initial token threshold is the full CQ
+				 * depth. After the first token pop, we need to
+				 * reset it to the dequeue_depth.
+				 */
+				qm_port->token_pop_thresh =
+					qm_port->dequeue_depth;
 
 				pop_offs = 1;
 				j++;
@@ -3260,62 +4364,110 @@ sw_credit_update:
 		return;
 	}
 	ev_port->outstanding_releases -= i;
+#if DLB_SW_CREDITS_CHECKS
 	ev_port->inflight_credits += i;
 
 	/* Replenish s/w credits if enough releases are performed */
 	dlb2_replenish_sw_credits(dlb2, ev_port);
+#endif
 }
 
 static inline void
 dlb2_port_credits_inc(struct dlb2_port *qm_port, int num)
 {
 	uint32_t batch_size = qm_port->hw_credit_quanta;
+	int val;
 
 	/* increment port credits, and return to pool if exceeds threshold */
-	if (!qm_port->is_directed) {
-		if (qm_port->dlb2->version == DLB2_HW_V2) {
-			qm_port->cached_ldb_credits += num;
-			if (qm_port->cached_ldb_credits >= 2 * batch_size) {
-				__atomic_fetch_add(
-					qm_port->credit_pool[DLB2_LDB_QUEUE],
-					batch_size, __ATOMIC_SEQ_CST);
-				qm_port->cached_ldb_credits -= batch_size;
-			}
-		} else {
-			qm_port->cached_credits += num;
-			if (qm_port->cached_credits >= 2 * batch_size) {
-				__atomic_fetch_add(
-				      qm_port->credit_pool[DLB2_COMBINED_POOL],
-				      batch_size, __ATOMIC_SEQ_CST);
-				qm_port->cached_credits -= batch_size;
-			}
+	if (qm_port->dlb2->version == DLB2_HW_V2_5) {
+		qm_port->cached_credits += num;
+		if (qm_port->cached_credits >= 2 * batch_size) {
+			val = qm_port->cached_credits - batch_size;
+			__atomic_fetch_add(
+			    qm_port->credit_pool[DLB2_COMBINED_POOL], val,
+			    __ATOMIC_SEQ_CST);
+			qm_port->cached_credits -= val;
+		}
+	} else if (!qm_port->is_directed) {
+		qm_port->cached_ldb_credits += num;
+		if (qm_port->cached_ldb_credits >= 2 * batch_size) {
+			val = qm_port->cached_ldb_credits - batch_size;
+			__atomic_fetch_add(qm_port->credit_pool[DLB2_LDB_QUEUE],
+					   val, __ATOMIC_SEQ_CST);
+			qm_port->cached_ldb_credits -= val;
 		}
 	} else {
-		if (qm_port->dlb2->version == DLB2_HW_V2) {
-			qm_port->cached_dir_credits += num;
-			if (qm_port->cached_dir_credits >= 2 * batch_size) {
-				__atomic_fetch_add(
-					qm_port->credit_pool[DLB2_DIR_QUEUE],
-					batch_size, __ATOMIC_SEQ_CST);
-				qm_port->cached_dir_credits -= batch_size;
-			}
-		} else {
-			qm_port->cached_credits += num;
-			if (qm_port->cached_credits >= 2 * batch_size) {
-				__atomic_fetch_add(
-				      qm_port->credit_pool[DLB2_COMBINED_POOL],
-				      batch_size, __ATOMIC_SEQ_CST);
-				qm_port->cached_credits -= batch_size;
-			}
+		qm_port->cached_dir_credits += num;
+		if (qm_port->cached_dir_credits >= 2 * batch_size) {
+			val = qm_port->cached_dir_credits - batch_size;
+			__atomic_fetch_add(qm_port->credit_pool[DLB2_DIR_QUEUE],
+					   val, __ATOMIC_SEQ_CST);
+			qm_port->cached_dir_credits -= val;
 		}
 	}
+}
+
+static inline void
+dlb2_issue_int_arm_hcw(struct dlb2_port *qm_port)
+{
+	struct process_local_port_data *port_data;
+	struct dlb2_enqueue_qe *qe;
+
+	RTE_ASSERT(qm_port->config_state == DLB2_CONFIGURED);
+
+	qe = qm_port->int_arm_qe;
+
+	/* No store fence needed since no pointer is being sent */
+
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
+	dlb2_pp_write(port_data, qe);
+
+	DLB2_LOG_DBG("dlb2: issued interrupt_arm QE\n");
+
+	qm_port->int_armed = true;
+}
+
+static inline int
+dlb2_block_on_cq_interrupt(struct dlb2_hw_dev *handle,
+			   struct dlb2_port *qm_port,
+			   struct dlb2_eventdev_port *ev_port)
+{
+	struct process_local_port_data *port_data;
+	int ret;
+
+	if (!qm_port->int_armed)
+		dlb2_issue_int_arm_hcw(qm_port);
+
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
+	/* Note: it's safe to access the per-process cq_base address here,
+	 * since the PMD won't block on the CQ until after attempting at least
+	 * one CQ dequeue.
+	 */
+	ret = dlb2_iface_block_on_cq_interrupt(handle,
+					qm_port->id,
+					!ev_port->qm_port.is_directed,
+					&port_data->cq_base[qm_port->cq_idx],
+					qm_port->gen_bit,
+					false);
+
+	if (ret == EPERM)
+		DLB2_LOG_DBG("dlb2: Not enough interupts available (for VF)\n");
+
+	/* If the CQ int ioctl was unsuccessful, the interrupt remains armed */
+	qm_port->int_armed = (ret != 0);
+
+	return ret;
 }
 
 #define CLB_MASK_IDX 0
 #define CLB_VAL_IDX 1
 static int
 dlb2_monitor_callback(const uint64_t val,
-		const uint64_t opaque[RTE_POWER_MONITOR_OPAQUE_SZ])
+		      const uint64_t opaque[RTE_POWER_MONITOR_OPAQUE_SZ])
 {
 	/* abort if the value matches */
 	return (val & opaque[CLB_MASK_IDX]) == opaque[CLB_VAL_IDX] ? -1 : 0;
@@ -3328,19 +4480,47 @@ dlb2_dequeue_wait(struct dlb2_eventdev *dlb2,
 		  uint64_t timeout,
 		  uint64_t start_ticks)
 {
+	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
 	struct process_local_port_data *port_data;
 	uint64_t elapsed_ticks;
 
-	port_data = &dlb2_port[qm_port->id][PORT_TYPE(qm_port)];
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
 
 	elapsed_ticks = rte_get_timer_cycles() - start_ticks;
 
 	/* Wait/poll time expired */
 	if (elapsed_ticks >= timeout) {
+		if (dlb2->run_state == DLB2_RUN_STATE_STARTED &&
+		    qm_port->dequeue_wait == DLB2_PORT_DEQUEUE_WAIT_INTERRUPT) {
+			/* Return all credits before blocking if remaining credits in
+			 * system is less than quanta.
+			 */
+			uint32_t sw_inflights = __atomic_load_n(&dlb2->inflights, __ATOMIC_SEQ_CST);
+			uint32_t quanta = ev_port->credit_update_quanta;
+
+			if (dlb2->new_event_limit - sw_inflights < quanta)
+				dlb2_check_and_return_credits(ev_port, true, 0);
+			/* Block on CQ interrupt. */
+			int ret = dlb2_block_on_cq_interrupt(handle,
+							     qm_port,
+							     ev_port);
+			if (ret != 0) {
+				DLB2_LOG_DBG("dlb2: wait for interrupt ret=%d\n",
+					     ret);
+				rte_errno = ret;
+				return 1;
+			}
+
+			DLB2_INC_STAT(ev_port->stats.traffic.rx_interrupt_wait,
+				      1);
+			return 0;
+		}
 		return 1;
-	} else if (dlb2->umwait_allowed) {
-		struct rte_power_monitor_cond pmc;
+	} else if (dlb2->umwait_allowed &&
+		   (qm_port->dequeue_wait == DLB2_PORT_DEQUEUE_WAIT_UMWAIT)) {
 		volatile struct dlb2_dequeue_qe *cq_base;
+		struct rte_power_monitor_cond pmc;
 		union {
 			uint64_t raw_qe[2];
 			struct dlb2_dequeue_qe qe;
@@ -3396,7 +4576,7 @@ dlb2_process_dequeue_qes(struct dlb2_eventdev_port *ev_port,
 
 	for (i = 0, num = 0; i < cnt; i++) {
 		struct dlb2_dequeue_qe *qe = &qes[i];
-		int sched_type_map[DLB2_NUM_HW_SCHED_TYPES] = {
+		static int sched_type_map[DLB2_NUM_HW_SCHED_TYPES] = {
 			[DLB2_SCHED_ATOMIC] = RTE_SCHED_TYPE_ATOMIC,
 			[DLB2_SCHED_UNORDERED] = RTE_SCHED_TYPE_PARALLEL,
 			[DLB2_SCHED_ORDERED] = RTE_SCHED_TYPE_ORDERED,
@@ -3421,7 +4601,8 @@ dlb2_process_dequeue_qes(struct dlb2_eventdev_port *ev_port,
 		events[num].event_type = qe->u.event_type.major;
 		events[num].sub_event_type = qe->u.event_type.sub;
 		events[num].sched_type = sched_type_map[qe->sched_type];
-		events[num].impl_opaque = qe->qid_depth;
+		events[num].impl_opaque = qm_port->reorder_id++;
+		DLB2_SET_QID_DEPTH(&events[num], qe->qid_depth);
 
 		/* qid not preserved for directed queues */
 		if (qm_port->is_directed)
@@ -3448,7 +4629,7 @@ dlb2_process_dequeue_four_qes(struct dlb2_eventdev_port *ev_port,
 			      struct rte_event *events,
 			      struct dlb2_dequeue_qe *qes)
 {
-	int sched_type_map[] = {
+	static int sched_type_map[] = {
 		[DLB2_SCHED_ATOMIC] = RTE_SCHED_TYPE_ATOMIC,
 		[DLB2_SCHED_UNORDERED] = RTE_SCHED_TYPE_PARALLEL,
 		[DLB2_SCHED_ORDERED] = RTE_SCHED_TYPE_ORDERED,
@@ -3456,7 +4637,6 @@ dlb2_process_dequeue_four_qes(struct dlb2_eventdev_port *ev_port,
 	};
 	const int num_events = DLB2_NUM_QES_PER_CACHE_LINE;
 	uint8_t *qid_mappings = qm_port->qid_mappings;
-	__m128i sse_evt[2];
 
 	/* In the unlikely case that any of the QE error bits are set, process
 	 * them one at a time.
@@ -3466,179 +4646,49 @@ dlb2_process_dequeue_four_qes(struct dlb2_eventdev_port *ev_port,
 		return dlb2_process_dequeue_qes(ev_port, qm_port, events,
 						 qes, num_events);
 
-	events[0].u64 = qes[0].data;
-	events[1].u64 = qes[1].data;
-	events[2].u64 = qes[2].data;
-	events[3].u64 = qes[3].data;
+	const __m128i qe_to_ev_shuffle =
+	    _mm_set_epi8(7, 6, 5, 4, 3, 2, 1, 0, /* last 8-bytes = data from first 8 */
+			 0xFF, 0xFF, 0xFF, 0xFF, /* fill in later as 32-bit value*/
+			 9, 8,			 /* event type and sub-event, + 4 zero bits */
+			 13, 12 /* flow id, 16 bits */);
+	for (int i = 0; i < 4; i++) {
+		const __m128i hw_qe = _mm_load_si128((void *)&qes[i]);
+		const __m128i event = _mm_shuffle_epi8(hw_qe, qe_to_ev_shuffle);
+		/* prepare missing 32-bits for op, sched_type, QID, Priority and
+		 * sequence number in impl_opaque
+		 */
+		const uint16_t qid_sched_prio = _mm_extract_epi16(hw_qe, 5);
+		/* Extract qid_depth and format it as per event header */
+		const uint8_t qid_depth = (_mm_extract_epi8(hw_qe, 15) & 0x6) << 1;
+		const uint32_t qid =  (qm_port->is_directed) ? ev_port->link[0].queue_id : 
+					qid_mappings[(uint8_t)qid_sched_prio];
+		const uint32_t sched_type = sched_type_map[(qid_sched_prio >> 8) & 0x3];
+		const uint32_t priority = (qid_sched_prio >> 5) & 0xE0;
 
-	/* Construct the metadata portion of two struct rte_events
-	 * in one 128b SSE register. Event metadata is constructed in the SSE
-	 * registers like so:
-	 * sse_evt[0][63:0]:   event[0]'s metadata
-	 * sse_evt[0][127:64]: event[1]'s metadata
-	 * sse_evt[1][63:0]:   event[2]'s metadata
-	 * sse_evt[1][127:64]: event[3]'s metadata
-	 */
-	sse_evt[0] = _mm_setzero_si128();
-	sse_evt[1] = _mm_setzero_si128();
+		const uint32_t dword1 = qid_depth |
+		    sched_type << 6 | qid << 8 | priority << 16 | (qm_port->reorder_id + i) << 24;
 
-	/* Convert the hardware queue ID to an event queue ID and store it in
-	 * the metadata:
-	 * sse_evt[0][47:40]   = qid_mappings[qes[0].qid]
-	 * sse_evt[0][111:104] = qid_mappings[qes[1].qid]
-	 * sse_evt[1][47:40]   = qid_mappings[qes[2].qid]
-	 * sse_evt[1][111:104] = qid_mappings[qes[3].qid]
-	 */
-#define DLB_EVENT_QUEUE_ID_BYTE 5
-	sse_evt[0] = _mm_insert_epi8(sse_evt[0],
-				     qid_mappings[qes[0].qid],
-				     DLB_EVENT_QUEUE_ID_BYTE);
-	sse_evt[0] = _mm_insert_epi8(sse_evt[0],
-				     qid_mappings[qes[1].qid],
-				     DLB_EVENT_QUEUE_ID_BYTE + 8);
-	sse_evt[1] = _mm_insert_epi8(sse_evt[1],
-				     qid_mappings[qes[2].qid],
-				     DLB_EVENT_QUEUE_ID_BYTE);
-	sse_evt[1] = _mm_insert_epi8(sse_evt[1],
-				     qid_mappings[qes[3].qid],
-				     DLB_EVENT_QUEUE_ID_BYTE + 8);
-
-	/* Convert the hardware priority to an event priority and store it in
-	 * the metadata, while also returning the queue depth status
-	 * value captured by the hardware, storing it in impl_opaque, which can
-	 * be read by the application but not modified
-	 * sse_evt[0][55:48]   = DLB2_TO_EV_PRIO(qes[0].priority)
-	 * sse_evt[0][63:56]   = qes[0].qid_depth
-	 * sse_evt[0][119:112] = DLB2_TO_EV_PRIO(qes[1].priority)
-	 * sse_evt[0][127:120] = qes[1].qid_depth
-	 * sse_evt[1][55:48]   = DLB2_TO_EV_PRIO(qes[2].priority)
-	 * sse_evt[1][63:56]   = qes[2].qid_depth
-	 * sse_evt[1][119:112] = DLB2_TO_EV_PRIO(qes[3].priority)
-	 * sse_evt[1][127:120] = qes[3].qid_depth
-	 */
-#define DLB_EVENT_PRIO_IMPL_OPAQUE_WORD 3
-#define DLB_BYTE_SHIFT 8
-	sse_evt[0] =
-		_mm_insert_epi16(sse_evt[0],
-			DLB2_TO_EV_PRIO((uint8_t)qes[0].priority) |
-			(qes[0].qid_depth << DLB_BYTE_SHIFT),
-			DLB_EVENT_PRIO_IMPL_OPAQUE_WORD);
-	sse_evt[0] =
-		_mm_insert_epi16(sse_evt[0],
-			DLB2_TO_EV_PRIO((uint8_t)qes[1].priority) |
-			(qes[1].qid_depth << DLB_BYTE_SHIFT),
-			DLB_EVENT_PRIO_IMPL_OPAQUE_WORD + 4);
-	sse_evt[1] =
-		_mm_insert_epi16(sse_evt[1],
-			DLB2_TO_EV_PRIO((uint8_t)qes[2].priority) |
-			(qes[2].qid_depth << DLB_BYTE_SHIFT),
-			DLB_EVENT_PRIO_IMPL_OPAQUE_WORD);
-	sse_evt[1] =
-		_mm_insert_epi16(sse_evt[1],
-			DLB2_TO_EV_PRIO((uint8_t)qes[3].priority) |
-			(qes[3].qid_depth << DLB_BYTE_SHIFT),
-			DLB_EVENT_PRIO_IMPL_OPAQUE_WORD + 4);
-
-	/* Write the event type, sub event type, and flow_id to the event
-	 * metadata.
-	 * sse_evt[0][31:0]   = qes[0].flow_id |
-	 *			qes[0].u.event_type.major << 28 |
-	 *			qes[0].u.event_type.sub << 20;
-	 * sse_evt[0][95:64]  = qes[1].flow_id |
-	 *			qes[1].u.event_type.major << 28 |
-	 *			qes[1].u.event_type.sub << 20;
-	 * sse_evt[1][31:0]   = qes[2].flow_id |
-	 *			qes[2].u.event_type.major << 28 |
-	 *			qes[2].u.event_type.sub << 20;
-	 * sse_evt[1][95:64]  = qes[3].flow_id |
-	 *			qes[3].u.event_type.major << 28 |
-	 *			qes[3].u.event_type.sub << 20;
-	 */
-#define DLB_EVENT_EV_TYPE_DW 0
-#define DLB_EVENT_EV_TYPE_SHIFT 28
-#define DLB_EVENT_SUB_EV_TYPE_SHIFT 20
-	sse_evt[0] = _mm_insert_epi32(sse_evt[0],
-			qes[0].flow_id |
-			qes[0].u.event_type.major << DLB_EVENT_EV_TYPE_SHIFT |
-			qes[0].u.event_type.sub <<  DLB_EVENT_SUB_EV_TYPE_SHIFT,
-			DLB_EVENT_EV_TYPE_DW);
-	sse_evt[0] = _mm_insert_epi32(sse_evt[0],
-			qes[1].flow_id |
-			qes[1].u.event_type.major << DLB_EVENT_EV_TYPE_SHIFT |
-			qes[1].u.event_type.sub <<  DLB_EVENT_SUB_EV_TYPE_SHIFT,
-			DLB_EVENT_EV_TYPE_DW + 2);
-	sse_evt[1] = _mm_insert_epi32(sse_evt[1],
-			qes[2].flow_id |
-			qes[2].u.event_type.major << DLB_EVENT_EV_TYPE_SHIFT |
-			qes[2].u.event_type.sub <<  DLB_EVENT_SUB_EV_TYPE_SHIFT,
-			DLB_EVENT_EV_TYPE_DW);
-	sse_evt[1] = _mm_insert_epi32(sse_evt[1],
-			qes[3].flow_id |
-			qes[3].u.event_type.major << DLB_EVENT_EV_TYPE_SHIFT  |
-			qes[3].u.event_type.sub << DLB_EVENT_SUB_EV_TYPE_SHIFT,
-			DLB_EVENT_EV_TYPE_DW + 2);
-
-	/* Write the sched type to the event metadata. 'op' and 'rsvd' are not
-	 * set:
-	 * sse_evt[0][39:32]  = sched_type_map[qes[0].sched_type] << 6
-	 * sse_evt[0][103:96] = sched_type_map[qes[1].sched_type] << 6
-	 * sse_evt[1][39:32]  = sched_type_map[qes[2].sched_type] << 6
-	 * sse_evt[1][103:96] = sched_type_map[qes[3].sched_type] << 6
-	 */
-#define DLB_EVENT_SCHED_TYPE_BYTE 4
-#define DLB_EVENT_SCHED_TYPE_SHIFT 6
-	sse_evt[0] = _mm_insert_epi8(sse_evt[0],
-		sched_type_map[qes[0].sched_type] << DLB_EVENT_SCHED_TYPE_SHIFT,
-		DLB_EVENT_SCHED_TYPE_BYTE);
-	sse_evt[0] = _mm_insert_epi8(sse_evt[0],
-		sched_type_map[qes[1].sched_type] << DLB_EVENT_SCHED_TYPE_SHIFT,
-		DLB_EVENT_SCHED_TYPE_BYTE + 8);
-	sse_evt[1] = _mm_insert_epi8(sse_evt[1],
-		sched_type_map[qes[2].sched_type] << DLB_EVENT_SCHED_TYPE_SHIFT,
-		DLB_EVENT_SCHED_TYPE_BYTE);
-	sse_evt[1] = _mm_insert_epi8(sse_evt[1],
-		sched_type_map[qes[3].sched_type] << DLB_EVENT_SCHED_TYPE_SHIFT,
-		DLB_EVENT_SCHED_TYPE_BYTE + 8);
-
-	/* Store the metadata to the event (use the double-precision
-	 * _mm_storeh_pd because there is no integer function for storing the
-	 * upper 64b):
-	 * events[0].event = sse_evt[0][63:0]
-	 * events[1].event = sse_evt[0][127:64]
-	 * events[2].event = sse_evt[1][63:0]
-	 * events[3].event = sse_evt[1][127:64]
-	 */
-	_mm_storel_epi64((__m128i *)&events[0].event, sse_evt[0]);
-	_mm_storeh_pd((double *)&events[1].event, (__m128d) sse_evt[0]);
-	_mm_storel_epi64((__m128i *)&events[2].event, sse_evt[1]);
-	_mm_storeh_pd((double *)&events[3].event, (__m128d) sse_evt[1]);
+		/* events[] may not be 16 byte aligned. So use separate load and store */
+		const __m128i tmpEv = _mm_insert_epi32(event, dword1, 1);
+		_mm_storeu_si128((__m128i *) &events[i], tmpEv);
+	}
+	qm_port->reorder_id += 4;
 
 	DLB2_INC_STAT(ev_port->stats.rx_sched_cnt[qes[0].sched_type], 1);
 	DLB2_INC_STAT(ev_port->stats.rx_sched_cnt[qes[1].sched_type], 1);
 	DLB2_INC_STAT(ev_port->stats.rx_sched_cnt[qes[2].sched_type], 1);
 	DLB2_INC_STAT(ev_port->stats.rx_sched_cnt[qes[3].sched_type], 1);
 
-	DLB2_INC_STAT(
-		ev_port->stats.queue[events[0].queue_id].
-			qid_depth[qes[0].qid_depth],
-		1);
-	DLB2_INC_STAT(
-		ev_port->stats.queue[events[1].queue_id].
-			qid_depth[qes[1].qid_depth],
-		1);
-	DLB2_INC_STAT(
-		ev_port->stats.queue[events[2].queue_id].
-			qid_depth[qes[2].qid_depth],
-		1);
-	DLB2_INC_STAT(
-		ev_port->stats.queue[events[3].queue_id].
-			qid_depth[qes[3].qid_depth],
-		1);
+	DLB2_INC_STAT(ev_port->stats.queue[events[0].queue_id].qid_depth[qes[0].qid_depth], 1);
+	DLB2_INC_STAT(ev_port->stats.queue[events[1].queue_id].qid_depth[qes[1].qid_depth], 1);
+	DLB2_INC_STAT(ev_port->stats.queue[events[2].queue_id].qid_depth[qes[2].qid_depth], 1);
+	DLB2_INC_STAT(ev_port->stats.queue[events[3].queue_id].qid_depth[qes[3].qid_depth], 1);
 
 	DLB2_INC_STAT(ev_port->stats.traffic.rx_ok, num_events);
 
 	return num_events;
 }
+
 
 static __rte_always_inline int
 dlb2_recv_qe_sparse(struct dlb2_port *qm_port, struct dlb2_dequeue_qe *qe)
@@ -3651,9 +4701,10 @@ dlb2_recv_qe_sparse(struct dlb2_port *qm_port, struct dlb2_dequeue_qe *qe)
 	uintptr_t addr[4];
 	uint16_t idx;
 
-	cq_addr = dlb2_port[qm_port->id][PORT_TYPE(qm_port)].cq_base;
-
+	cq_addr = dlb2_port[qm_port->evdev_id][qm_port->id]
+			   [PORT_TYPE(qm_port)].cq_base;
 	idx = qm_port->cq_idx_unmasked & qm_port->cq_depth_mask;
+
 	/* Load the next 4 QEs */
 	addr[0] = (uintptr_t)&cq_addr[idx];
 	addr[1] = (uintptr_t)&cq_addr[(idx +  4) & qm_port->cq_depth_mask];
@@ -3715,7 +4766,7 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 	 * Each v_qe_[0-4] is just a 16-byte load of the whole QE. It is
 	 * passed along in registers as the QE data is required later.
 	 *
-	 * v_qe_meta is an u32 unpack of all 4x QEs. A.k.a, it contains one
+	 * v_qe_meta is an u32 unpack of all 4x QEs. Aka, it contains one
 	 * 32-bit slice of each QE, so makes up a full SSE register. This
 	 * allows parallel processing of 4x QEs in a single register.
 	 */
@@ -3726,10 +4777,17 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 	int hw_qid2 = _mm_extract_epi8(v_qe_meta, 10);
 	int hw_qid3 = _mm_extract_epi8(v_qe_meta, 14);
 
-	int ev_qid0 = qm_port->qid_mappings[hw_qid0];
-	int ev_qid1 = qm_port->qid_mappings[hw_qid1];
-	int ev_qid2 = qm_port->qid_mappings[hw_qid2];
-	int ev_qid3 = qm_port->qid_mappings[hw_qid3];
+	int ev_qid0, ev_qid1, ev_qid2, ev_qid3;
+
+	if (qm_port->is_directed) {
+		ev_qid0 = ev_qid1 = ev_qid2 = ev_qid3 =
+			qm_port->ev_port->link[0].queue_id;
+	} else {
+		ev_qid0 = qm_port->qid_mappings[hw_qid0];
+		ev_qid1 = qm_port->qid_mappings[hw_qid1];
+		ev_qid2 = qm_port->qid_mappings[hw_qid2];
+		ev_qid3 = qm_port->qid_mappings[hw_qid3];
+	}
 
 	int hw_sched0 = _mm_extract_epi8(v_qe_meta, 3) & 3ul;
 	int hw_sched1 = _mm_extract_epi8(v_qe_meta, 7) & 3ul;
@@ -3743,7 +4801,7 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 
 	/* Schedule field remapping using byte shuffle
 	 * - Full byte containing sched field handled here (op, rsvd are zero)
-	 * - Note sanitizing the register requires two masking ANDs:
+	 * - Note santizing the register requires two masking ANDs:
 	 *   1) to strip prio/msg_type from byte for correct shuffle lookup
 	 *   2) to strip any non-sched-field lanes from any results to OR later
 	 * - Final byte result is >> 10 to another byte-lane inside the u32.
@@ -3764,6 +4822,14 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 			0x00, 0x00, 0x00, 0x03,
 			0x00, 0x00, 0x00, 0x03,
 		};
+		static const uint8_t qid_depth_mask[16] = {
+			0x00, 0x00, 0x00, 0x06,
+			0x00, 0x00, 0x00, 0x06,
+			0x00, 0x00, 0x00, 0x06,
+			0x00, 0x00, 0x00, 0x06,
+		};
+		const __m128i v_qid_depth_mask  = _mm_loadu_si128(
+						  (const __m128i *)qid_depth_mask);
 		const __m128i v_sched_map = _mm_loadu_si128(
 					     (const __m128i *)sched_type_map);
 		__m128i v_sched_mask = _mm_loadu_si128(
@@ -3774,6 +4840,9 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 		__m128i v_preshift = _mm_and_si128(v_sched_remapped,
 						   v_sched_mask);
 		v_sched_done = _mm_srli_epi32(v_preshift, 10);
+		__m128i v_qid_depth =  _mm_and_si128(v_qe_status, v_qid_depth_mask);
+		v_qid_depth = _mm_srli_epi32(v_qid_depth, 15);
+		v_sched_done = _mm_or_si128(v_sched_done, v_qid_depth);
 	}
 
 	/* Priority handling
@@ -3826,9 +4895,10 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 					(const __m128i *)sub_event_mask);
 		__m128i v_flow_mask  = _mm_loadu_si128(
 				       (const __m128i *)flow_mask);
-		__m128i v_sub = _mm_srli_epi32(v_qe_meta, 8);
+		__m128i v_sub = _mm_srli_epi32(v_qe_meta, 4);
 		v_sub = _mm_and_si128(v_sub, v_sub_event_mask);
-		__m128i v_type = _mm_and_si128(v_qe_meta, v_event_mask);
+		__m128i v_type = _mm_srli_epi32(v_qe_meta, 12);
+		v_type = _mm_and_si128(v_type, v_event_mask);
 		v_type = _mm_slli_epi32(v_type, 8);
 		v_types_done = _mm_or_si128(v_type, v_sub);
 		v_types_done = _mm_slli_epi32(v_types_done, 20);
@@ -3856,29 +4926,42 @@ _process_deq_qes_vec_impl(struct dlb2_port *qm_port,
 	case 4:
 		v_ev_3 = _mm_blend_epi16(v_unpk_ev_23, v_qe_3, 0x0F);
 		v_ev_3 = _mm_alignr_epi8(v_ev_3, v_ev_3, 8);
+		v_ev_3 = _mm_insert_epi8(v_ev_3, qm_port->reorder_id + 3, 7);
 		_mm_storeu_si128((__m128i *)&events[3], v_ev_3);
 		DLB2_INC_STAT(qm_port->ev_port->stats.rx_sched_cnt[hw_sched3],
 			      1);
+		DLB2_INC_STAT(qm_port->ev_port->stats.queue[ev_qid3].\
+				qid_depth[DLB2_GET_QID_DEPTH(&events[3])], 1);
 		/* fallthrough */
 	case 3:
 		v_ev_2 = _mm_unpacklo_epi64(v_unpk_ev_23, v_qe_2);
+		v_ev_2 = _mm_insert_epi8(v_ev_2, qm_port->reorder_id + 2, 7);
 		_mm_storeu_si128((__m128i *)&events[2], v_ev_2);
 		DLB2_INC_STAT(qm_port->ev_port->stats.rx_sched_cnt[hw_sched2],
 			      1);
+		DLB2_INC_STAT(qm_port->ev_port->stats.queue[ev_qid2].\
+				qid_depth[DLB2_GET_QID_DEPTH(&events[2])], 1);
 		/* fallthrough */
 	case 2:
 		v_ev_1 = _mm_blend_epi16(v_unpk_ev_01, v_qe_1, 0x0F);
 		v_ev_1 = _mm_alignr_epi8(v_ev_1, v_ev_1, 8);
+		v_ev_1 = _mm_insert_epi8(v_ev_1, qm_port->reorder_id + 1, 7);
 		_mm_storeu_si128((__m128i *)&events[1], v_ev_1);
 		DLB2_INC_STAT(qm_port->ev_port->stats.rx_sched_cnt[hw_sched1],
 			      1);
+		DLB2_INC_STAT(qm_port->ev_port->stats.queue[ev_qid1].\
+				qid_depth[DLB2_GET_QID_DEPTH(&events[1])], 1);
 		/* fallthrough */
 	case 1:
 		v_ev_0 = _mm_unpacklo_epi64(v_unpk_ev_01, v_qe_0);
+		v_ev_0 = _mm_insert_epi8(v_ev_0, qm_port->reorder_id, 7);
 		_mm_storeu_si128((__m128i *)&events[0], v_ev_0);
 		DLB2_INC_STAT(qm_port->ev_port->stats.rx_sched_cnt[hw_sched0],
 			      1);
+		DLB2_INC_STAT(qm_port->ev_port->stats.queue[ev_qid0].\
+				qid_depth[DLB2_GET_QID_DEPTH(&events[0])], 1);
 	}
+	qm_port->reorder_id += valid_events;
 }
 
 static __rte_always_inline int
@@ -3889,7 +4972,8 @@ dlb2_recv_qe_sparse_vec(struct dlb2_port *qm_port, void *events,
 	uint16_t idx = qm_port->cq_idx_unmasked;
 	volatile struct dlb2_dequeue_qe *cq_addr;
 
-	cq_addr = dlb2_port[qm_port->id][PORT_TYPE(qm_port)].cq_base;
+	cq_addr = dlb2_port[qm_port->evdev_id][qm_port->id]
+			   [PORT_TYPE(qm_port)].cq_base;
 
 	uintptr_t qe_ptr_3 = (uintptr_t)&cq_addr[(idx + 12) &
 						 qm_port->cq_depth_mask];
@@ -3994,21 +5078,35 @@ dlb2_hw_dequeue_sparse(struct dlb2_eventdev *dlb2,
 		       uint16_t max_num,
 		       uint64_t dequeue_timeout_ticks)
 {
+	uint64_t timeout;
 	uint64_t start_ticks = 0ULL;
 	struct dlb2_port *qm_port;
 	int num = 0;
 	bool use_scalar;
-	uint64_t timeout;
 
 	qm_port = &ev_port->qm_port;
 	use_scalar = qm_port->use_scalar;
+
+	/* We have a special implementation for waiting. Wait can be:
+	 * 1) no waiting at all
+	 * 2) busy poll only
+	 * 3) wait for interrupt. If wakeup and poll time
+	 * has expired, then return to caller
+	 * 4) umonitor/umwait repeatedly up to poll time
+	 */
+
+	/* If configured for per dequeue wait, then use wait value provided
+	 * to this API. Otherwise we must use the global
+	 * value from eventdev config time.
+	 */
 
 	if (!dlb2->global_dequeue_wait)
 		timeout = dequeue_timeout_ticks;
 	else
 		timeout = dlb2->global_dequeue_wait_ticks;
 
-	start_ticks = rte_get_timer_cycles();
+	if (timeout)
+		start_ticks = rte_get_timer_cycles();
 
 	use_scalar = use_scalar || (max_num & 0x3);
 
@@ -4036,14 +5134,18 @@ dlb2_hw_dequeue_sparse(struct dlb2_eventdev *dlb2,
 								num_avail);
 			if (n_iter != 0) {
 				num += n_iter;
-				/* update rolling_mask for vector code support */
+				/* update vector code rolling masks */
 				m_rshift = qm_port->cq_rolling_mask >> n_iter;
-				m_lshift = qm_port->cq_rolling_mask << (64 - n_iter);
-				m2_rshift = qm_port->cq_rolling_mask_2 >> n_iter;
+				m_lshift = qm_port->cq_rolling_mask <<
+					(64 - n_iter);
+				m2_rshift = qm_port->cq_rolling_mask_2 >>
+					n_iter;
 				m2_lshift = qm_port->cq_rolling_mask_2 <<
 					(64 - n_iter);
-				qm_port->cq_rolling_mask = (m_rshift | m2_lshift);
-				qm_port->cq_rolling_mask_2 = (m2_rshift | m_lshift);
+				qm_port->cq_rolling_mask =
+					(m_rshift | m2_lshift);
+				qm_port->cq_rolling_mask_2 =
+					(m2_rshift | m_lshift);
 			}
 		} else { /* !use_scalar */
 			num_avail = dlb2_recv_qe_sparse_vec(qm_port,
@@ -4071,7 +5173,9 @@ dlb2_hw_dequeue_sparse(struct dlb2_eventdev *dlb2,
 
 		ev_port->outstanding_releases += num;
 
+#if DLB_HW_CREDITS_CHECKS
 		dlb2_port_credits_inc(qm_port, num);
+#endif
 	}
 
 	return num;
@@ -4089,7 +5193,8 @@ dlb2_recv_qe(struct dlb2_port *qm_port, struct dlb2_dequeue_qe *qe,
 	uint64_t *cache_line_base;
 	uint8_t gen_bits;
 
-	cq_addr = dlb2_port[qm_port->id][PORT_TYPE(qm_port)].cq_base;
+	cq_addr = dlb2_port[qm_port->evdev_id][qm_port->id]
+			   [PORT_TYPE(qm_port)].cq_base;
 	cq_addr = &cq_addr[qm_port->cq_idx];
 
 	cache_line_base = (void *)(((uintptr_t)cq_addr) & ~0x3F);
@@ -4156,7 +5261,8 @@ dlb2_hw_dequeue(struct dlb2_eventdev *dlb2,
 	else
 		timeout = dlb2->global_dequeue_wait_ticks;
 
-	start_ticks = rte_get_timer_cycles();
+	if (timeout)
+		start_ticks = rte_get_timer_cycles();
 
 	while (num < max_num) {
 		struct dlb2_dequeue_qe qes[DLB2_NUM_QES_PER_CACHE_LINE];
@@ -4198,7 +5304,9 @@ dlb2_hw_dequeue(struct dlb2_eventdev *dlb2,
 
 		ev_port->outstanding_releases += num;
 
+#if DLB_HW_CREDITS_CHECKS
 		dlb2_port_credits_inc(qm_port, num);
+#endif
 	}
 
 	return num;
@@ -4210,16 +5318,39 @@ dlb2_event_dequeue_burst(void *event_port, struct rte_event *ev, uint16_t num,
 {
 	struct dlb2_eventdev_port *ev_port = event_port;
 	struct dlb2_port *qm_port = &ev_port->qm_port;
+	struct dlb2_reorder *order = qm_port->order;
 	struct dlb2_eventdev *dlb2 = ev_port->dlb2;
+	struct process_local_port_data *port_data;
 	uint16_t cnt;
 
 	RTE_ASSERT(ev_port->setup_done);
 	RTE_ASSERT(ev != NULL);
 
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
+	if (!port_data->mmaped)
+		dlb2_iface_port_mmap(qm_port);
+
 	if (ev_port->implicit_release && ev_port->outstanding_releases > 0) {
 		uint16_t out_rels = ev_port->outstanding_releases;
+		if (qm_port->reorder_en) {
+			/* for directed, no-op command-byte = 0, but set dsi field */
+			/* for load-balanced, set COMP */
+			uint64_t release_u64 =
+			    qm_port->is_directed ? 0xFF : (uint64_t)DLB2_COMP_CMD_BYTE << 56;
 
-		dlb2_event_release(dlb2, ev_port->id, out_rels);
+			/* go through reorder buffer looking for missing releases. */
+			/* TODO: copy implementation for sparse dequeue */
+			for (uint8_t i = order->next_to_enqueue; i != qm_port->reorder_id; i++)
+				if (order->enq_reorder[i].u64[1] == 0)
+					order->enq_reorder[i].u64[1] = release_u64;
+
+			__dlb2_event_enqueue_burst_reorder(event_port, NULL, 0,
+						   qm_port->token_pop_mode == DELAYED_POP);
+		} else {
+			dlb2_event_release(dlb2, ev_port->id, out_rels);
+		}
 
 		DLB2_INC_STAT(ev_port->stats.tx_implicit_rel, out_rels);
 	}
@@ -4231,6 +5362,8 @@ dlb2_event_dequeue_burst(void *event_port, struct rte_event *ev, uint16_t num,
 
 	DLB2_INC_STAT(ev_port->stats.traffic.total_polls, 1);
 	DLB2_INC_STAT(ev_port->stats.traffic.zero_polls, ((cnt == 0) ? 1 : 0));
+	dlb2_check_and_return_credits(ev_port, !cnt,
+				      DLB2_ZERO_DEQ_CREDIT_RETURN_THRES);
 
 	return cnt;
 }
@@ -4247,17 +5380,52 @@ dlb2_event_dequeue_burst_sparse(void *event_port, struct rte_event *ev,
 {
 	struct dlb2_eventdev_port *ev_port = event_port;
 	struct dlb2_port *qm_port = &ev_port->qm_port;
+	struct dlb2_reorder *order = qm_port->order;
 	struct dlb2_eventdev *dlb2 = ev_port->dlb2;
+	struct process_local_port_data *port_data;
 	uint16_t cnt;
 
 	RTE_ASSERT(ev_port->setup_done);
 	RTE_ASSERT(ev != NULL);
 
+	port_data = &dlb2_port[qm_port->evdev_id][qm_port->id]
+			      [PORT_TYPE(qm_port)];
+
+	if (!port_data->mmaped)
+		dlb2_iface_port_mmap(qm_port);
+
 	if (ev_port->implicit_release && ev_port->outstanding_releases > 0) {
 		uint16_t out_rels = ev_port->outstanding_releases;
+		if (qm_port->reorder_en) {
+			struct rte_event release_burst[8];
+			int num_releases = 0;
 
-		dlb2_event_release(dlb2, ev_port->id, out_rels);
+			/* go through reorder buffer looking for missing releases. */
+			for (uint8_t i = order->next_to_enqueue; i != qm_port->reorder_id; i++) {
+				if (order->enq_reorder[i].u64[1] == 0) {
+					release_burst[num_releases++] = (struct rte_event){
+						.op = RTE_EVENT_OP_RELEASE,
+							.impl_opaque = i,
+					};
 
+					if (num_releases == RTE_DIM(release_burst)) {
+						__dlb2_event_enqueue_burst_reorder(event_port, release_burst,
+							RTE_DIM(release_burst),
+							qm_port->token_pop_mode == DELAYED_POP);
+						num_releases = 0;
+					}
+				}
+			}
+
+			if (num_releases)
+				__dlb2_event_enqueue_burst_reorder(event_port, release_burst
+					, num_releases, qm_port->token_pop_mode == DELAYED_POP);
+		} else {
+			dlb2_event_release(dlb2, ev_port->id, out_rels);
+		}
+
+		if (ev_port->outstanding_releases != 0)
+			rte_panic("Still outstanding releases %d\n", ev_port->outstanding_releases);
 		DLB2_INC_STAT(ev_port->stats.tx_implicit_rel, out_rels);
 	}
 
@@ -4268,6 +5436,9 @@ dlb2_event_dequeue_burst_sparse(void *event_port, struct rte_event *ev,
 
 	DLB2_INC_STAT(ev_port->stats.traffic.total_polls, 1);
 	DLB2_INC_STAT(ev_port->stats.traffic.zero_polls, ((cnt == 0) ? 1 : 0));
+	dlb2_check_and_return_credits(ev_port, !cnt,
+				      DLB2_ZERO_DEQ_CREDIT_RETURN_THRES);
+
 	return cnt;
 }
 
@@ -4282,11 +5453,16 @@ static void
 dlb2_flush_port(struct rte_eventdev *dev, int port_id)
 {
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
+	struct dlb2_eventdev_port *ev_port = &dlb2->ev_ports[port_id];
+	struct dlb2_reorder *order = ev_port->qm_port.order;
 	eventdev_stop_flush_t flush;
 	struct rte_event ev;
 	uint8_t dev_id;
 	void *arg;
 	int i;
+
+	if (!ev_port->setup_done)
+		return;
 
 	flush = dev->dev_ops->dev_stop_flush;
 	dev_id = dev->data->dev_id;
@@ -4307,8 +5483,10 @@ dlb2_flush_port(struct rte_eventdev *dev, int port_id)
 	/* Enqueue any additional outstanding releases */
 	ev.op = RTE_EVENT_OP_RELEASE;
 
-	for (i = dlb2->ev_ports[port_id].outstanding_releases; i > 0; i--)
+	for (i = dlb2->ev_ports[port_id].outstanding_releases; i > 0; i--) {
+		ev.impl_opaque = order ? order->next_to_enqueue : 0;
 		rte_event_enqueue_burst(dev_id, port_id, &ev, 1);
+	}
 }
 
 static uint32_t
@@ -4323,8 +5501,11 @@ dlb2_get_ldb_queue_depth(struct dlb2_eventdev *dlb2,
 
 	ret = dlb2_iface_get_ldb_queue_depth(handle, &cfg);
 	if (ret < 0) {
+		int status;
+		status = cfg.response.status < RTE_DIM(dlb2_error_strings) ?
+			cfg.response.status : DLB2_ST_INVALID_CQ_DEPTH;
 		DLB2_LOG_ERR("dlb2: get_ldb_queue_depth ret=%d (driver status: %s)\n",
-			     ret, dlb2_error_strings[cfg.response.status]);
+			     ret, dlb2_error_strings[status]);
 		return ret;
 	}
 
@@ -4343,8 +5524,11 @@ dlb2_get_dir_queue_depth(struct dlb2_eventdev *dlb2,
 
 	ret = dlb2_iface_get_dir_queue_depth(handle, &cfg);
 	if (ret < 0) {
+		int status;
+		status = cfg.response.status < RTE_DIM(dlb2_error_strings) ?
+			cfg.response.status : DLB2_ST_INVALID_CQ_DEPTH;
 		DLB2_LOG_ERR("dlb2: get_dir_queue_depth ret=%d (driver status: %s)\n",
-			     ret, dlb2_error_strings[cfg.response.status]);
+			     ret, dlb2_error_strings[status]);
 		return ret;
 	}
 
@@ -4359,6 +5543,61 @@ dlb2_get_queue_depth(struct dlb2_eventdev *dlb2,
 		return dlb2_get_dir_queue_depth(dlb2, queue);
 	else
 		return dlb2_get_ldb_queue_depth(dlb2, queue);
+}
+
+#define RET_ERR(param, ret, err_str)                                                                         \
+	do {                                                                                                 \
+		if (!ret)                                                                                    \
+			ret = -EINVAL;                                                                       \
+		DLB2_LOG_ERR("dlb2: dlb2_set_port_param error, param=%lx ret=%d %s\n", param, ret, err_str); \
+		return ret;                                                                                  \
+	} while (0)
+
+int
+dlb2_set_port_param(struct dlb2_eventdev *dlb2,
+		    int port_id,
+		    uint64_t param_flags,
+		    void *param_val)
+{
+	struct dlb2_port_param *port_param = (struct dlb2_port_param *)param_val;
+	struct dlb2_port *port = &dlb2->ev_ports[port_id].qm_port;
+	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
+	int ret = 0, bit = 0;
+
+	while (param_flags) {
+		uint64_t param = rte_bit_relaxed_test_and_clear64(bit++, &param_flags);
+
+		if (!param)
+			continue;
+		switch (param) {
+			case DLB2_FLOW_MIGRATION_THRESHOLD:
+				if (dlb2->version == DLB2_HW_V2_5) {
+					struct dlb2_cq_inflight_ctrl_args args = {0};
+
+					args.enable = true;
+					args.port_id = port->id;
+					args.threshold = port_param->inflight_threshold;
+					if (dlb2->ev_ports[port_id].setup_done)
+						ret = dlb2_iface_set_cq_inflight_ctrl(handle, &args);
+					if (ret)
+						RET_ERR(param, ret, "Failed to set inflight threshold");
+					port->enable_inflight_ctrl = true;
+					port->inflight_threshold = args.threshold;
+				} else {
+					RET_ERR(param, ret, "FLOW_MIGRATION_THRESHOLD is only supported for 2.5 HW");
+				}
+				break;
+			case DLB2_SET_PORT_HL:
+				if (dlb2->ev_ports[port_id].setup_done)
+					RET_ERR(param, ret, "DLB2_SET_PORT_HL must be called before setting up port");
+				port->hist_list = port_param->port_hl;
+				break;
+			default:
+				RET_ERR(param, ret, "Unsupported flag");
+		}
+	}
+
+	return ret;
 }
 
 static bool
@@ -4400,9 +5639,11 @@ static void
 dlb2_drain(struct rte_eventdev *dev)
 {
 	struct dlb2_eventdev *dlb2 = dlb2_pmd_priv(dev);
+	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
 	struct dlb2_eventdev_port *ev_port = NULL;
+	struct dlb2_stop_domain_args cfg;
 	uint8_t dev_id;
-	int i;
+	int i, ret;
 
 	dev_id = dev->data->dev_id;
 
@@ -4420,7 +5661,7 @@ dlb2_drain(struct rte_eventdev *dev)
 
 	/* If the domain's queues are empty, we're done. */
 	if (dlb2_queues_empty(dlb2))
-		return;
+		goto domain_cleanup;
 
 	/* Else, there must be at least one unlinked load-balanced queue.
 	 * Select a load-balanced port with which to drain the unlinked
@@ -4449,7 +5690,6 @@ dlb2_drain(struct rte_eventdev *dev)
 
 	for (i = 0; i < dlb2->num_queues; i++) {
 		uint8_t qid, prio;
-		int ret;
 
 		if (dlb2_queue_is_empty(dlb2, &dlb2->ev_queues[i]))
 			continue;
@@ -4480,6 +5720,101 @@ dlb2_drain(struct rte_eventdev *dev)
 			return;
 		}
 	}
+
+domain_cleanup:
+	for (i = 0; i < dlb2->num_ports; i++)
+		dlb2_set_port_ctrl(&dlb2->ev_ports[i], false);
+
+	ret = dlb2_iface_sched_domain_stop(handle, &cfg);
+	if (ret < 0) {
+		DLB2_LOG_ERR("dlb2: sched_domain_stop ret=%d (driver status: %s)\n",
+			     ret, dlb2_error_strings[cfg.response.status]);
+		return;
+	}
+}
+
+int
+dlb2_get_sched_idle_counts(struct dlb2_eventdev *dlb2)
+{
+	uint64_t active_sched_cycles, total_idle_cycles, clk_gated_cycles;
+	struct dlb2_hw_dev *handle = &dlb2->qm_instance;
+	struct dlb2_sched_cycles_percent *dev_cycles;
+	uint64_t total_cycles, powered_on_cycles;
+	struct dlb2_sched_idle_counts *data;
+	int ret;
+
+	dev_cycles = &handle->dev_cycles_pct;
+	data = &handle->idle_counts;
+
+	memset(dev_cycles, 0, sizeof(*dev_cycles));
+	memset(data, 0, sizeof(*data));
+
+	if (dlb2 == NULL || handle == NULL)
+		return -EINVAL;
+
+	ret = dlb2_iface_get_sched_idle_counts(handle, data);
+	if (ret != 0) {
+		DLB2_LOG_ERR("Failed to read scheduler idle counters\n");
+		return ret;
+	}
+
+	/* Compute percentages of device cycles spent idle */
+	total_cycles = data->perf_clk_on_cnt;
+	powered_on_cycles = data->perf_proc_on_cnt;
+	clk_gated_cycles = total_cycles - powered_on_cycles;
+	active_sched_cycles = data->ldb_perf_sched_cnt * 8;
+	total_idle_cycles = data->ldb_perf_nowork_idle_cnt +
+			    data->ldb_perf_nospace_idle_cnt +
+			    data->ldb_perf_pfriction_idle_cnt +
+			    clk_gated_cycles;
+
+	/* In the unlikely scenario of total_cycles == 0,
+	 * to avoid divide by zero crash
+	 */
+	RTE_ASSERT(total_cycles != 0);
+
+	dev_cycles->total_sched_pct = (DLB2_PERF_MAX_PERCENT *
+				       active_sched_cycles) /
+				       total_cycles;
+
+	if (total_idle_cycles == 0) {
+		DLB2_LOG_ERR("No missed scheduling cycles due to no-work/no-CQ "
+			      "space/pipeline-friction\n");
+		return -EINVAL;
+	}
+
+	dev_cycles->total_idle_pct = DLB2_PERF_MAX_PERCENT -
+				     dev_cycles->total_sched_pct;
+
+	dev_cycles->clk_gated_pct = (DLB2_PERF_MAX_PERCENT -
+				     ((float)data->perf_proc_on_cnt *
+				     DLB2_PERF_MAX_PERCENT /
+				     total_cycles)) *
+				     dev_cycles->total_idle_pct;
+
+	dev_cycles->nowork_idle_pct = (dev_cycles->total_idle_pct *
+				       (data->ldb_perf_nowork_idle_cnt -
+				       data->ldb_perf_fidlimit_idle_cnt)) /
+				       total_idle_cycles;
+
+	dev_cycles->nospace_idle_pct = (dev_cycles->total_idle_pct *
+					(data->ldb_perf_nospace_idle_cnt -
+					data->ldb_perf_iflimit_idle_cnt)) /
+					total_idle_cycles;
+
+	dev_cycles->pfriction_idle_pct = (dev_cycles->total_idle_pct *
+					  data->ldb_perf_pfriction_idle_cnt) /
+					  total_idle_cycles;
+
+	dev_cycles->iflimit_idle_pct = (dev_cycles->total_idle_pct *
+					data->ldb_perf_iflimit_idle_cnt) /
+					total_idle_cycles;
+
+	dev_cycles->fidlimit_idle_pct = (dev_cycles->total_idle_pct *
+					 data->ldb_perf_fidlimit_idle_cnt) /
+					 total_idle_cycles;
+
+	return 0;
 }
 
 static void
@@ -4512,9 +5847,7 @@ dlb2_eventdev_stop(struct rte_eventdev *dev)
 static int
 dlb2_eventdev_close(struct rte_eventdev *dev)
 {
-	dlb2_hw_reset_sched_domain(dev, false);
-
-	return 0;
+	return dlb2_hw_reset_sched_domain(dev, false);
 }
 
 static void
@@ -4600,49 +5933,86 @@ dlb2_entry_points_init(struct rte_eventdev *dev)
 	}
 }
 
+static void
+dlb2_qm_mmio_fn_init(void)
+{
+	/* Process-local function pointers for performing low level port i/o */
+
+	if (rte_cpu_get_flag_enabled(RTE_CPUFLAG_MOVDIR64B))
+		qm_mmio_fns.pp_enqueue_four = dlb2_movdir64b;
+	else
+		qm_mmio_fns.pp_enqueue_four = dlb2_movntdq;
+}
+
+static int
+dlb2_init_producer_cores(struct dlb2_eventdev *dlb2, const struct dlb2_devargs *dev_args)
+{
+	struct dlb2_create_sched_domain_args *args = &dlb2->qm_instance.cfg.resources;
+	const char *mask = dev_args->producer_coremask;
+	int i, cores[RTE_MAX_LCORE];
+
+	if (strlen(mask) && rte_eal_parse_coremask(mask, cores)) {
+		DLB2_LOG_ERR("Invalid producer coremask=%s", mask);
+		return -1;
+	}
+
+	memset(args->pcore_bmp, 0, sizeof(args->pcore_bmp));
+	memset(args->core_bmp, 0, sizeof(args->core_bmp));
+
+	for (i = 0; i < RTE_MAX_LCORE; i++) {
+		if (rte_lcore_is_enabled(i))
+			args->core_bmp[i / __BITS_PER_LONG] |= 1ULL << (i % __BITS_PER_LONG);
+		if (strlen(mask) && cores[i] != -1)
+			args->pcore_bmp[i / __BITS_PER_LONG] |= 1ULL << (i % __BITS_PER_LONG);
+	}
+
+	return 0;
+}
+
 int
 dlb2_primary_eventdev_probe(struct rte_eventdev *dev,
 			    const char *name,
-			    struct dlb2_devargs *dlb2_args)
+			    struct dlb2_devargs *dlb2_args,
+			    bool is_vdev)
 {
 	struct dlb2_eventdev *dlb2;
 	int err, i;
 
 	dlb2 = dev->data->dev_private;
-
 	dlb2->event_dev = dev; /* backlink */
+	dlb2->is_vdev = is_vdev; /* backlink */
 
-	evdev_dlb2_default_info.driver_name = name;
+	dlb2_init_evdev_rsrcs(dlb2, name);
 
 	dlb2->max_num_events_override = dlb2_args->max_num_events;
 	dlb2->num_dir_credits_override = dlb2_args->num_dir_credits_override;
+	dlb2->qm_instance.device_path_id = dlb2_args->hwdev_id;
 	dlb2->poll_interval = dlb2_args->poll_interval;
-	dlb2->sw_credit_quanta = dlb2_args->sw_credit_quanta;
-	dlb2->hw_credit_quanta = dlb2_args->hw_credit_quanta;
 	dlb2->default_depth_thresh = dlb2_args->default_depth_thresh;
-	dlb2->vector_opts_enabled = dlb2_args->vector_opts_enabled;
-
+	dlb2->vector_opts_disab = dlb2_args->vector_opts_disab;
+	dlb2->enable_cq_weight = dlb2_args->enable_cq_weight;
+	dlb2->qm_instance.num_ordered_queues_0 =
+		dlb2_args->num_ordered_queues_0;
+	dlb2->qm_instance.num_ordered_queues_1 =
+		dlb2_args->num_ordered_queues_1;
 
 	if (dlb2_args->max_cq_depth != 0)
 		dlb2->max_cq_depth = dlb2_args->max_cq_depth;
 	else
 		dlb2->max_cq_depth = DLB2_DEFAULT_CQ_DEPTH;
 
-	evdev_dlb2_default_info.max_event_port_dequeue_depth = dlb2->max_cq_depth;
-
 	if (dlb2_args->max_enq_depth != 0)
-		dlb2->max_enq_depth = dlb2_args->max_enq_depth;
-	else
-		dlb2->max_enq_depth = DLB2_DEFAULT_CQ_DEPTH;
+		dlb2->qm_instance.evdev_rsrcs.max_event_port_enqueue_depth =
+			dlb2_args->max_enq_depth;
 
-	evdev_dlb2_default_info.max_event_port_enqueue_depth =
-		dlb2->max_enq_depth;
-
-	dlb2_init_queue_depth_thresholds(dlb2,
-					 dlb2_args->qid_depth_thresholds.val);
-
-	dlb2_init_cq_weight(dlb2,
-			    dlb2_args->cq_weight.limit);
+	dlb2->qm_instance.evdev_rsrcs.max_event_port_dequeue_depth = dlb2->max_cq_depth;
+	err = dlb2_init_producer_cores(dlb2, dlb2_args);
+	if (err < 0) {
+		DLB2_LOG_ERR("could not init pcores, err=%d\n",
+			     err);
+		rte_event_pmd_release(dev);
+		return err;
+	}
 
 	dlb2_init_port_cos(dlb2,
 			   dlb2_args->port_cos.cos_id);
@@ -4654,11 +6024,13 @@ dlb2_primary_eventdev_probe(struct rte_eventdev *dev,
 	if (err < 0) {
 		DLB2_LOG_ERR("could not open event hardware device, err=%d\n",
 			     err);
+		rte_event_pmd_release(dev);
 		return err;
 	}
 
 	err = dlb2_iface_get_device_version(&dlb2->qm_instance,
-					    &dlb2->revision);
+					    &dlb2->revision,
+					    &dlb2->version);
 	if (err < 0) {
 		DLB2_LOG_ERR("dlb2: failed to get the device version, err=%d\n",
 			     err);
@@ -4672,28 +6044,66 @@ dlb2_primary_eventdev_probe(struct rte_eventdev *dev,
 		return err;
 	}
 
-	dlb2_iface_hardware_init(&dlb2->qm_instance);
+	if (dlb2_args->use_default_hl) {
+		dlb2->default_port_hl = DLB2_FIXED_CQ_HL_SIZE;
+		if (dlb2_args->alloc_hl_entries)
+			DLB2_LOG_ERR(": Ignoring 'alloc_hl_entries' and using "
+				     "default history list sizes for eventdev:"
+				     " %s\n", dev->data->name);
+                dlb2->hl_entries = 0;
+	} else {
+		dlb2->default_port_hl = 2 * DLB2_FIXED_CQ_HL_SIZE;
 
-	/* configure class of service */
-	{
-		struct dlb2_set_cos_bw_args
-			set_cos_bw_args = { {0} };
-		int id;
-		int ret = 0;
-
-		for (id = 0; id < DLB2_COS_NUM_VALS; id++) {
-			set_cos_bw_args.cos_id = id;
-			set_cos_bw_args.bandwidth = dlb2->cos_bw[id];
-			ret = dlb2_iface_set_cos_bw(&dlb2->qm_instance,
-						    &set_cos_bw_args);
-			if (ret != 0)
-				break;
+		if (dlb2_args->alloc_hl_entries >
+		    dlb2->hw_rsrc_query_results.num_hist_list_entries) {
+			DLB2_LOG_ERR(": Insufficient HL entries asked=%d "
+				     "available=%d for eventdev: %s\n",
+				     dlb2->hl_entries,
+				     dlb2->hw_rsrc_query_results.num_hist_list_entries,
+				     dev->data->name);
+                        return -EINVAL;
 		}
-		if (ret) {
-			DLB2_LOG_ERR("dlb2: failed to configure class of service, err=%d\n",
-				     err);
+		dlb2->hl_entries = dlb2_args->alloc_hl_entries;
+	}
+
+	if (dlb2->is_vdev) {
+		err = dlb2_register_pri_mp_callbacks();
+		if (err) {
+			DLB2_LOG_ERR("dlb2_register_pri_mp_callbacks err=%d for %s\n",
+				     err, name);
 			return err;
 		}
+	}
+
+	dlb2_iface_hardware_init(&dlb2->qm_instance);
+
+	if (!dlb2->is_vdev) {
+
+		/* configure class of service */
+		{
+			struct dlb2_set_cos_bw_args
+				set_cos_bw_args = { {0} };
+			int id;
+			int ret = 0;
+
+			for (id = 0; id < DLB2_COS_NUM_VALS; id++) {
+				set_cos_bw_args.cos_id = id;
+				set_cos_bw_args.bandwidth = dlb2->cos_bw[id];
+				ret = dlb2_iface_set_cos_bw(&dlb2->qm_instance,
+								&set_cos_bw_args);
+				if (ret != 0)
+					break;
+			}
+			if (ret) {
+				DLB2_LOG_ERR("dlb2: failed to configure class of service, err=%d\n",
+						err);
+				return err;
+			}
+		}
+
+	} else {
+		DLB2_LOG_DBG("Port specific COS is not supported for bifurcated mode,"
+				"pls set COS through sysfs calls.\n");
 	}
 
 	err = dlb2_iface_get_cq_poll_mode(&dlb2->qm_instance, &dlb2->poll_mode);
@@ -4716,29 +6126,56 @@ dlb2_primary_eventdev_probe(struct rte_eventdev *dev,
 
 	rte_spinlock_init(&dlb2->qm_instance.resource_lock);
 
+	dlb2_qm_mmio_fn_init();
+
 	dlb2_iface_low_level_io_init();
 
 	dlb2_entry_points_init(dev);
+
+	dlb2_init_queue_depth_thresholds(dlb2,
+					 dlb2_args->qid_depth_thresholds.val);
+
+	err = dlb2_init_port_dequeue_wait(dlb2,
+					  dlb2_args->port_dequeue_wait.val);
+	if (err) {
+		DLB2_LOG_ERR("dlb2: failed to init port_dequeue_wait, err=%d\n", err);
+		return err;
+	}
+
+	dlb2_init_quanta_credits(dlb2,
+				 dlb2_args->sw_credit_quanta,
+				 dlb2_args->hw_credit_quanta);
 
 	return 0;
 }
 
 int
 dlb2_secondary_eventdev_probe(struct rte_eventdev *dev,
-			      const char *name)
+			      const char *name,
+			      bool is_vdev)
 {
 	struct dlb2_eventdev *dlb2;
 	int err;
 
 	dlb2 = dev->data->dev_private;
 
-	evdev_dlb2_default_info.driver_name = name;
+	dlb2_init_evdev_rsrcs(dlb2, name);
 
 	err = dlb2_iface_open(&dlb2->qm_instance, name);
 	if (err < 0) {
 		DLB2_LOG_ERR("could not open event hardware device, err=%d\n",
 			     err);
+		rte_event_pmd_release(dev);
 		return err;
+	}
+
+	if (is_vdev) {
+		err = dlb2_register_sec_mp_callbacks();
+		if (err) {
+			DLB2_LOG_ERR("dlb2_register_sec_mp_callbacks err=%d for %s\n",
+				     err, name);
+			return err;
+		}
 	}
 
 	err = dlb2_hw_query_resources(dlb2);
@@ -4747,6 +6184,8 @@ dlb2_secondary_eventdev_probe(struct rte_eventdev *dev,
 			     err, name);
 		return err;
 	}
+
+	dlb2_qm_mmio_fn_init();
 
 	dlb2_iface_low_level_io_init();
 
@@ -4765,29 +6204,37 @@ dlb2_parse_params(const char *params,
 	static const char * const args[] = { NUMA_NODE_ARG,
 					     DLB2_MAX_NUM_EVENTS,
 					     DLB2_NUM_DIR_CREDITS,
-					     DEV_ID_ARG,
+					     HWDEV_ID_ARG,
 					     DLB2_QID_DEPTH_THRESH_ARG,
+					     DLB2_VECTOR_OPTS_DISAB_ARG,
+					     DLB2_PORT_DEQUEUE_WAIT_ARG,
 					     DLB2_POLL_INTERVAL_ARG,
 					     DLB2_SW_CREDIT_QUANTA_ARG,
 					     DLB2_HW_CREDIT_QUANTA_ARG,
 					     DLB2_DEPTH_THRESH_ARG,
-					     DLB2_VECTOR_OPTS_ENAB_ARG,
+					     DLB2_NUM_ORDERED_QUEUES_0,
+					     DLB2_NUM_ORDERED_QUEUES_1,
 					     DLB2_MAX_CQ_DEPTH,
 					     DLB2_MAX_ENQ_DEPTH,
-					     DLB2_CQ_WEIGHT,
+					     DLB2_PRODUCER_COREMASK,
 					     DLB2_PORT_COS,
 					     DLB2_COS_BW,
-					     DLB2_PRODUCER_COREMASK,
 					     DLB2_DEFAULT_LDB_PORT_ALLOCATION_ARG,
+					     DLB2_ENABLE_CQ_WEIGHT_ARG,
+					     DLB2_USE_DEFAULT_HL,
+					     DLB2_ALLOC_HL_ENTRIES,
 					     NULL };
 
 	if (params != NULL && params[0] != '\0') {
 		struct rte_kvargs *kvlist = rte_kvargs_parse(params, args);
 
 		if (kvlist == NULL) {
-			RTE_LOG(INFO, PMD,
-				"Ignoring unsupported parameters when creating device '%s'\n",
+			DLB2_LOG_ERR("Unsupported parameters when creating device '%s'\n",
 				name);
+			DLB2_LOG_ERR("Supported params:");
+			for (int i = 0; i < (int) RTE_DIM(args) && args[i]; ++i)
+				rte_log(RTE_LOG_NOTICE, eventdev_dlb2_log_level, "\t%s\n", args[i]);
+			ret = -EINVAL;
 		} else {
 			int ret = rte_kvargs_process(kvlist, NUMA_NODE_ARG,
 						     set_numa_node,
@@ -4799,9 +6246,18 @@ dlb2_parse_params(const char *params,
 				return ret;
 			}
 
-			ret = rte_kvargs_process(kvlist, DLB2_MAX_NUM_EVENTS,
-						 set_max_num_events,
-						 &dlb2_args->max_num_events);
+			if (version == DLB2_HW_V2) {
+				ret = rte_kvargs_process(kvlist,
+						DLB2_MAX_NUM_EVENTS,
+						set_max_num_events,
+						&dlb2_args->max_num_events);
+			} else {
+				ret = rte_kvargs_process(kvlist,
+						DLB2_MAX_NUM_EVENTS,
+						set_max_num_events_v2_5,
+						&dlb2_args->max_num_events);
+			}
+
 			if (ret != 0) {
 				DLB2_LOG_ERR("%s: Error parsing max_num_events parameter",
 					     name);
@@ -4821,11 +6277,22 @@ dlb2_parse_params(const char *params,
 					return ret;
 				}
 			}
-			ret = rte_kvargs_process(kvlist, DEV_ID_ARG,
-						 set_dev_id,
-						 &dlb2_args->dev_id);
+			ret = rte_kvargs_process(kvlist, HWDEV_ID_ARG,
+						 set_hwdev_id,
+						 &dlb2_args->hwdev_id);
 			if (ret != 0) {
-				DLB2_LOG_ERR("%s: Error parsing dev_id parameter",
+				DLB2_LOG_ERR("%s: Error parsing hwdev_id parameter",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+
+			ret = rte_kvargs_process(kvlist,
+						 DLB2_VECTOR_OPTS_DISAB_ARG,
+						 set_vector_opts_disab,
+						 &dlb2_args->vector_opts_disab);
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing vector_opts_disab parameter",
 					     name);
 				rte_kvargs_free(kvlist);
 				return ret;
@@ -4851,11 +6318,41 @@ dlb2_parse_params(const char *params,
 				return ret;
 			}
 
+			if (version == DLB2_HW_V2) {
+				ret = rte_kvargs_process(
+					kvlist,
+					DLB2_PORT_DEQUEUE_WAIT_ARG,
+					set_port_dequeue_wait,
+					&dlb2_args->port_dequeue_wait);
+			} else {
+				ret = rte_kvargs_process(
+					kvlist,
+					DLB2_PORT_DEQUEUE_WAIT_ARG,
+					set_port_dequeue_wait_v2_5,
+					&dlb2_args->port_dequeue_wait);
+			}
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing port_dequeue_wait parameter",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+
 			ret = rte_kvargs_process(kvlist, DLB2_POLL_INTERVAL_ARG,
 						 set_poll_interval,
 						 &dlb2_args->poll_interval);
 			if (ret != 0) {
 				DLB2_LOG_ERR("%s: Error parsing poll interval parameter",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+
+			ret = rte_kvargs_process(kvlist, DLB2_DEPTH_THRESH_ARG,
+						 set_default_depth_thresh,
+						 &dlb2_args->default_depth_thresh);
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing set depth thresh parameter",
 					     name);
 				rte_kvargs_free(kvlist);
 				return ret;
@@ -4883,33 +6380,34 @@ dlb2_parse_params(const char *params,
 				return ret;
 			}
 
-			ret = rte_kvargs_process(kvlist, DLB2_DEPTH_THRESH_ARG,
-					set_default_depth_thresh,
-					&dlb2_args->default_depth_thresh);
+			ret = rte_kvargs_process(kvlist,
+					 DLB2_NUM_ORDERED_QUEUES_0,
+					 set_num_ordered_queues,
+					 &dlb2_args->num_ordered_queues_0);
 			if (ret != 0) {
-				DLB2_LOG_ERR("%s: Error parsing set depth thresh parameter",
+				DLB2_LOG_ERR("%s: Error parsing num_ordered_queues_0 parameter",
 					     name);
 				rte_kvargs_free(kvlist);
 				return ret;
 			}
 
 			ret = rte_kvargs_process(kvlist,
-					DLB2_VECTOR_OPTS_ENAB_ARG,
-					set_vector_opts_enab,
-					&dlb2_args->vector_opts_enabled);
+					 DLB2_NUM_ORDERED_QUEUES_1,
+					 set_num_ordered_queues,
+					 &dlb2_args->num_ordered_queues_1);
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing num_ordered_queues_1 parameter",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+
+			ret = rte_kvargs_process(kvlist,
+						 DLB2_MAX_CQ_DEPTH,
+						 set_max_cq_depth,
+						 &dlb2_args->max_cq_depth);
 			if (ret != 0) {
 				DLB2_LOG_ERR("%s: Error parsing vector opts enabled",
-					     name);
-				rte_kvargs_free(kvlist);
-				return ret;
-			}
-
-			ret = rte_kvargs_process(kvlist,
-					DLB2_MAX_CQ_DEPTH,
-					set_max_cq_depth,
-					&dlb2_args->max_cq_depth);
-			if (ret != 0) {
-				DLB2_LOG_ERR("%s: Error parsing max cq depth",
 					     name);
 				rte_kvargs_free(kvlist);
 				return ret;
@@ -4927,11 +6425,11 @@ dlb2_parse_params(const char *params,
 			}
 
 			ret = rte_kvargs_process(kvlist,
-					DLB2_CQ_WEIGHT,
-					set_cq_weight,
-					&dlb2_args->cq_weight);
+					 DLB2_PRODUCER_COREMASK,
+					 set_producer_coremask,
+					 &dlb2_args->producer_coremask);
 			if (ret != 0) {
-				DLB2_LOG_ERR("%s: Error parsing cq weight on",
+				DLB2_LOG_ERR("%s: Error parsing producer coremask",
 					     name);
 				rte_kvargs_free(kvlist);
 				return ret;
@@ -4959,19 +6457,6 @@ dlb2_parse_params(const char *params,
 				return ret;
 			}
 
-
-			ret = rte_kvargs_process(kvlist,
-						 DLB2_PRODUCER_COREMASK,
-						 set_producer_coremask,
-						 &dlb2_args->producer_coremask);
-			if (ret != 0) {
-				DLB2_LOG_ERR(
-					"%s: Error parsing producer coremask",
-					name);
-				rte_kvargs_free(kvlist);
-				return ret;
-			}
-
 			ret = rte_kvargs_process(kvlist,
 						 DLB2_DEFAULT_LDB_PORT_ALLOCATION_ARG,
 						 set_default_ldb_port_allocation,
@@ -4983,9 +6468,42 @@ dlb2_parse_params(const char *params,
 				return ret;
 			}
 
+			ret = rte_kvargs_process(kvlist,
+						 DLB2_ENABLE_CQ_WEIGHT_ARG,
+						 set_enable_cq_weight,
+						 &dlb2_args->enable_cq_weight);
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing enable_cq_weight arg",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+			if (version == DLB2_HW_V2 && dlb2_args->enable_cq_weight)
+				DLB2_LOG_INFO("Ignoring 'enable_cq_weight=y'. Only supported for 2.5 HW onwards");
+
+			ret = rte_kvargs_process(kvlist, DLB2_USE_DEFAULT_HL,
+						 set_hl_override,
+						 &dlb2_args->use_default_hl);
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing hl_override arg",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+
+			ret = rte_kvargs_process(kvlist, DLB2_ALLOC_HL_ENTRIES,
+						 set_hl_entries,
+						 &dlb2_args->alloc_hl_entries);
+			if (ret != 0) {
+				DLB2_LOG_ERR("%s: Error parsing hl_override arg",
+					     name);
+				rte_kvargs_free(kvlist);
+				return ret;
+			}
+
 			rte_kvargs_free(kvlist);
 		}
 	}
 	return ret;
 }
-RTE_LOG_REGISTER_DEFAULT(eventdev_dlb2_log_level, NOTICE);
+RTE_LOG_REGISTER(eventdev_dlb2_log_level, pmd.event.dlb2, NOTICE);

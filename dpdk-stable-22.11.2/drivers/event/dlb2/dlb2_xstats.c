@@ -32,11 +32,21 @@ enum dlb2_xstats_type {
 	ldb_pool_size,
 	dir_pool_size,
 	pool_size,
+	total_active_sched_cycles_pct,
+	total_idle_cycles_pct,
+	clk_gated_cycles_pct,
+	no_work_idle_cycles_pct,
+	no_space_idle_cycles_pct,
+	pipeline_friction_idle_cycles_pct,
+	inflight_limit_idle_cycles_pct,
+	fid_limit_idle_cycles_pct,
+	hcw_error_cnt,
 	/* port specific */
 	tx_new,				/**< Send an OP_NEW event */
 	tx_fwd,				/**< Send an OP_FORWARD event */
 	tx_rel,				/**< Send an OP_RELEASE event */
 	tx_implicit_rel,		/**< Issue an implicit event release */
+	tx_frag,			/**< Send a frag event */
 	tx_sched_ordered,		/**< Send a SCHED_TYPE_ORDERED event */
 	tx_sched_unordered,		/**< Send a SCHED_TYPE_PARALLEL event */
 	tx_sched_atomic,		/**< Send a SCHED_TYPE_ATOMIC event */
@@ -65,8 +75,10 @@ enum dlb2_xstats_type {
 	/**< Depth GT 50%, but LE to 75% of the configured hardware threshold */
 	depth_gt75_le100_threshold,
 	/**< Depth GT 75%. but LE to the configured hardware threshold */
-	depth_gt100_threshold
+	depth_gt100_threshold,
 	/**< Depth GT 100% of the configured hw threshold */
+	hw_version
+	/**hw_version*/
 };
 
 typedef uint64_t (*dlb2_xstats_fn)(struct dlb2_eventdev *dlb2,
@@ -152,6 +164,55 @@ dlb2_device_traffic_stat_get(struct dlb2_eventdev *dlb2,
 }
 
 static uint64_t
+dlb2_device_idle_stat_get(struct dlb2_eventdev *dlb2,
+			  int which_stat)
+{
+	struct dlb2_sched_cycles_percent *pct;
+	struct dlb2_sched_idle_counts *cnts;
+	struct dlb2_hw_dev *handle;
+
+	handle = &dlb2->qm_instance;
+	pct = &handle->dev_cycles_pct;
+	cnts = &handle->idle_counts;
+
+	switch (which_stat) {
+	case total_active_sched_cycles_pct:
+		/* Update dlb2_sched_cycles_percent struct
+		 * with idle cnt percentages */
+		if (dlb2_get_sched_idle_counts(dlb2))
+			return -EINVAL;
+		return pct->total_sched_pct;
+
+	case total_idle_cycles_pct:
+		return pct->total_idle_pct;
+
+	case clk_gated_cycles_pct:
+		return pct->clk_gated_pct;
+
+	case no_work_idle_cycles_pct:
+		return pct->nowork_idle_pct;
+
+	case no_space_idle_cycles_pct:
+		return pct->nospace_idle_pct;
+
+	case pipeline_friction_idle_cycles_pct:
+		return pct->pfriction_idle_pct;
+
+	case inflight_limit_idle_cycles_pct:
+		return pct->iflimit_idle_pct;
+
+	case fid_limit_idle_cycles_pct:
+		return pct->fidlimit_idle_pct;
+
+	case hcw_error_cnt:
+		return cnts->hcw_err_cnt;
+
+	default: return -1;
+	}
+	return 0;
+}
+
+static uint64_t
 get_dev_stat(struct dlb2_eventdev *dlb2, uint16_t obj_idx __rte_unused,
 	     enum dlb2_xstats_type type, int extra_arg __rte_unused)
 {
@@ -180,6 +241,18 @@ get_dev_stat(struct dlb2_eventdev *dlb2, uint16_t obj_idx __rte_unused,
 		return dlb2->num_dir_credits;
 	case pool_size:
 		return dlb2->num_credits;
+	case total_active_sched_cycles_pct:
+	case total_idle_cycles_pct:
+	case clk_gated_cycles_pct:
+	case no_work_idle_cycles_pct:
+	case no_space_idle_cycles_pct:
+	case pipeline_friction_idle_cycles_pct:
+	case inflight_limit_idle_cycles_pct:
+	case fid_limit_idle_cycles_pct:
+	case hcw_error_cnt:
+		return dlb2_device_idle_stat_get(dlb2, type);
+	case hw_version:
+		return dlb2->version;
 	default: return -1;
 	}
 }
@@ -238,6 +311,8 @@ get_port_stat(struct dlb2_eventdev *dlb2, uint16_t obj_idx,
 
 	case tx_implicit_rel: return ev_port->stats.tx_implicit_rel;
 
+	case tx_frag: return ev_port->stats.tx_op_cnt[RTE_EVENT_DLB2_OP_FRAG];
+
 	case tx_sched_ordered:
 		return ev_port->stats.tx_sched_cnt[DLB2_SCHED_ORDERED];
 
@@ -255,7 +330,7 @@ get_port_stat(struct dlb2_eventdev *dlb2, uint16_t obj_idx,
 	case outstanding_releases: return ev_port->outstanding_releases;
 
 	case max_outstanding_releases:
-		return DLB2_NUM_HIST_LIST_ENTRIES_PER_LDB_PORT;
+		return dlb2->qm_instance.cfg.resources.num_hist_list_entries;
 
 	case rx_sched_ordered:
 		return ev_port->stats.rx_sched_cnt[DLB2_SCHED_ORDERED];
@@ -378,6 +453,16 @@ dlb2_xstats_init(struct dlb2_eventdev *dlb2)
 		"ldb_pool_size",
 		"dir_pool_size",
 		"pool_size",
+		"total_active_sched_cycles_pct",
+		"total_idle_cycles_pct",
+		"clk_gated_cycles_pct",
+		"no_work_idle_cycles_pct",
+		"no_space_idle_cycles_pct",
+		"pipeline_friction_idle_cycles_pct",
+		"inflight_limit_idle_cycles_pct",
+		"fid_limit_idle_cycles_pct",
+		"hcw_error_cnt",
+		"hw_version",
 	};
 	static const enum dlb2_xstats_type dev_types[] = {
 		rx_ok,
@@ -398,6 +483,16 @@ dlb2_xstats_init(struct dlb2_eventdev *dlb2)
 		ldb_pool_size,
 		dir_pool_size,
 		pool_size,
+		total_active_sched_cycles_pct,
+		total_idle_cycles_pct,
+		clk_gated_cycles_pct,
+		no_work_idle_cycles_pct,
+		no_space_idle_cycles_pct,
+		pipeline_friction_idle_cycles_pct,
+		inflight_limit_idle_cycles_pct,
+		fid_limit_idle_cycles_pct,
+		hcw_error_cnt,
+		hw_version,
 	};
 	/* Note: generated device stats are not allowed to be reset. */
 	static const uint8_t dev_reset_allowed[] = {
@@ -419,6 +514,16 @@ dlb2_xstats_init(struct dlb2_eventdev *dlb2)
 		0, /* ldb_pool_size */
 		0, /* dir_pool_size */
 		0, /* pool_size */
+		0, /* total_active_sched_cycles_pct */
+		0, /* total_idle_cycles_pct */
+		0, /* clk_gated_cycles_pct */
+		0, /* no_work_idle_cycles_pct */
+		0, /* no_space_idle_cycles_pct */
+		0, /* pipeline_friction_idle_cycles_pct */
+		0, /* inflight_limit_idle_cycles_pct */
+		0, /* fid_limit_idle_cycles_pct */
+		0, /* hcw_error_cnt */
+		0, /* hw_version */
 	};
 	static const char * const port_stats[] = {
 		"is_configured",
@@ -441,6 +546,7 @@ dlb2_xstats_init(struct dlb2_eventdev *dlb2)
 		"tx_fwd",
 		"tx_rel",
 		"tx_implicit_rel",
+		"tx_frag",
 		"tx_sched_ordered",
 		"tx_sched_unordered",
 		"tx_sched_atomic",
@@ -475,6 +581,7 @@ dlb2_xstats_init(struct dlb2_eventdev *dlb2)
 		tx_fwd,
 		tx_rel,
 		tx_implicit_rel,
+		tx_frag,
 		tx_sched_ordered,
 		tx_sched_unordered,
 		tx_sched_atomic,
@@ -509,6 +616,7 @@ dlb2_xstats_init(struct dlb2_eventdev *dlb2)
 		1, /* tx_fwd */
 		1, /* tx_rel */
 		1, /* tx_implicit_rel */
+		1, /* tx_frag */
 		1, /* tx_sched_ordered */
 		1, /* tx_sched_unordered */
 		1, /* tx_sched_atomic */
@@ -1093,8 +1201,8 @@ dlb2_eventdev_dump(struct rte_eventdev *dev, FILE *f)
 		fprintf(f, "\tport is %s\n",
 			p->qm_port.is_directed ? "directed" : "load balanced");
 
-		fprintf(f, "\toutstanding releases=%u\n",
-			p->outstanding_releases);
+		fprintf(f, "\tnum frags=%u, outstanding releases=%u\n",
+			p->num_frags, p->outstanding_releases);
 
 		fprintf(f, "\tinflight max=%u, inflight credits=%u\n",
 			p->inflight_max, p->inflight_credits);
@@ -1117,25 +1225,25 @@ dlb2_eventdev_dump(struct rte_eventdev *dev, FILE *f)
 		fprintf(f, "\tcached_ldb_credits=%u\n",
 			p->qm_port.cached_ldb_credits);
 
-		fprintf(f, "\tldb_credits = %u\n",
-			p->qm_port.ldb_credits);
-
 		fprintf(f, "\tcached_dir_credits = %u\n",
 			p->qm_port.cached_dir_credits);
 
-		fprintf(f, "\tdir_credits = %u\n",
-			p->qm_port.dir_credits);
-
 		fprintf(f, "\tcached_credits = %u\n",
 			p->qm_port.cached_credits);
-
-		fprintf(f, "\tdir_credits = %u\n",
-			p->qm_port.credits);
 
 		fprintf(f, "\tgenbit=%d, cq_idx=%d, cq_depth=%d\n",
 			p->qm_port.gen_bit,
 			p->qm_port.cq_idx,
 			p->qm_port.cq_depth);
+
+		if (p->qm_port.dequeue_wait == DLB2_PORT_DEQUEUE_WAIT_POLLING)
+			fprintf(f, "\tdequeue wait mode is polling\n");
+		else if (p->qm_port.dequeue_wait ==
+				DLB2_PORT_DEQUEUE_WAIT_INTERRUPT)
+			fprintf(f, "\tdequeue wait mode is interrupt\n");
+		else if (p->qm_port.dequeue_wait ==
+				DLB2_PORT_DEQUEUE_WAIT_UMWAIT)
+			fprintf(f, "\tdequeue wait mode is umwait\n");
 
 		fprintf(f, "\tinterrupt armed=%d\n",
 			p->qm_port.int_armed);
@@ -1192,6 +1300,9 @@ dlb2_eventdev_dump(struct rte_eventdev *dev, FILE *f)
 
 		fprintf(f, "\t\ttx_implicit_rel %" PRIu64 "\n",
 			p->stats.tx_implicit_rel);
+
+		fprintf(f, "\t\ttx_frag %" PRIu64 "\n",
+			p->stats.tx_op_cnt[RTE_EVENT_DLB2_OP_FRAG]);
 
 		fprintf(f, "\t\ttx_sched_ordered %" PRIu64 "\n",
 			p->stats.tx_sched_cnt[DLB2_SCHED_ORDERED]);

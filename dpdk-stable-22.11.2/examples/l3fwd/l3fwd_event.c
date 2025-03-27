@@ -219,6 +219,7 @@ void
 l3fwd_event_resource_setup(struct rte_eth_conf *port_conf)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
+	bool strict_single_link = false;
 	const event_loop_cb lpm_event_loop[2][2][2] = {
 		[0][0][0] = lpm_event_main_loop_tx_d,
 		[0][0][1] = lpm_event_main_loop_tx_d_burst,
@@ -265,16 +266,25 @@ l3fwd_event_resource_setup(struct rte_eth_conf *port_conf)
 	l3fwd_eth_dev_port_setup(port_conf);
 
 	/* Event device configuration */
-	event_queue_cfg = evt_rsrc->ops.event_device_setup();
+	event_queue_cfg = evt_rsrc->ops.event_device_setup(strict_single_link);
 
 	/* Event queue configuration */
-	evt_rsrc->ops.event_queue_setup(event_queue_cfg);
+	ret = evt_rsrc->ops.event_queue_setup(event_queue_cfg);
+	if (ret < 0) {
+		/* TX adapter config error; try with strict single-link configuration */
+		strict_single_link = true;
+		event_queue_cfg = evt_rsrc->ops.event_device_setup(strict_single_link);
+		ret = evt_rsrc->ops.event_queue_setup(event_queue_cfg);
+		/* If still error, panic */
+		if (ret < 0)
+			rte_panic("Error in configuring event queue for Tx adapter");
+	}
 
 	/* Event port configuration */
-	evt_rsrc->ops.event_port_setup();
+	evt_rsrc->ops.event_port_setup(strict_single_link);
 
 	/* Rx/Tx adapters configuration */
-	evt_rsrc->ops.adapter_setup();
+	evt_rsrc->ops.adapter_setup(strict_single_link);
 
 	/* Start event device */
 	ret = rte_event_dev_start(evt_rsrc->event_d_id);

@@ -638,7 +638,11 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	memset(queue_arr, 0, sizeof(uint8_t) * RTE_EVENT_MAX_QUEUES_PER_DEV);
 
 	rte_event_dev_info_get(opt->dev_id, &info);
-	ret = evt_configure_eventdev(opt, nb_queues, nb_ports);
+
+	/* Pass ethdev count to eventdev configuration to set single-link
+	 * port count. 1 single-link port to be configured per ethdev.
+	 */
+	ret = evt_configure_eventdev_with_adapter(opt, nb_queues, nb_ports, rte_eth_dev_count_avail());
 	if (ret) {
 		evt_err("failed to configure eventdev %d", opt->dev_id);
 		return ret;
@@ -679,7 +683,7 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 		opt->wkr_deq_dep = info.max_event_port_dequeue_depth;
 
 	/* port configuration */
-	const struct rte_event_port_conf p_conf = {
+	struct rte_event_port_conf p_conf = {
 			.dequeue_depth = opt->wkr_deq_dep,
 			.enqueue_depth = info.max_event_port_dequeue_depth,
 			.new_event_threshold = info.max_num_events,
@@ -715,6 +719,7 @@ pipeline_queue_eventdev_setup(struct evt_test *test, struct evt_options *opt)
 	if (ret)
 		return ret;
 
+	p_conf.event_port_cfg = RTE_EVENT_PORT_CFG_SINGLE_LINK;
 	ret = pipeline_event_tx_adapter_setup(opt, p_conf);
 	if (ret)
 		return ret;

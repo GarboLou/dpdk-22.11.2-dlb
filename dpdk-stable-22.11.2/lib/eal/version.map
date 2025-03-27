@@ -302,6 +302,7 @@ DPDK_23 {
 	rte_vlog;
 	rte_zmalloc;
 	rte_zmalloc_socket;
+	eal_parse_coremask;
 
 	local: *;
 };
@@ -440,6 +441,13 @@ EXPERIMENTAL {
 	rte_thread_detach;
 	rte_thread_equal;
 	rte_thread_join;
+
+	# added as part of RDK
+	rte_rdk_rel_major;
+	rte_rdk_rel_minor;
+	rte_rdk_rel_year;
+	rte_rdk_rel_month;
+	rte_rdk_rel_string;
 };
 
 INTERNAL {

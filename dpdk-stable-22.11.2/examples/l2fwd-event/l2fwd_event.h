@@ -15,7 +15,7 @@
 
 typedef uint32_t (*event_device_setup_cb)(struct l2fwd_resources *rsrc);
 typedef void (*event_port_setup_cb)(struct l2fwd_resources *rsrc);
-typedef void (*event_queue_setup_cb)(struct l2fwd_resources *rsrc,
+typedef int (*event_queue_setup_cb)(struct l2fwd_resources *rsrc,
 				     uint32_t event_queue_cfg);
 typedef void (*adapter_setup_cb)(struct l2fwd_resources *rsrc);
 typedef void (*event_loop_cb)(struct l2fwd_resources *rsrc);

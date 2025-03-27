@@ -8,7 +8,7 @@
 #include "l3fwd_event.h"
 
 static uint32_t
-l3fwd_event_device_setup_internal_port(void)
+l3fwd_event_device_setup_internal_port(__rte_unused bool strict_single_link)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	struct rte_event_dev_config event_d_conf = {
@@ -81,7 +81,7 @@ l3fwd_event_device_setup_internal_port(void)
 }
 
 static void
-l3fwd_event_port_setup_internal_port(void)
+l3fwd_event_port_setup_internal_port(__rte_unused bool strict_single_link)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	uint8_t event_d_id = evt_rsrc->event_d_id;
@@ -142,14 +142,14 @@ l3fwd_event_port_setup_internal_port(void)
 	evt_rsrc->def_p_conf = event_p_conf;
 }
 
-static void
+static int
 l3fwd_event_queue_setup_internal_port(uint32_t event_queue_cfg)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	uint8_t event_d_id = evt_rsrc->event_d_id;
 	struct rte_event_queue_conf event_q_conf = {
 		.nb_atomic_flows = 1024,
-		.nb_atomic_order_sequences = 1024,
+		.nb_atomic_order_sequences = 64,
 		.event_queue_cfg = event_queue_cfg,
 		.priority = RTE_EVENT_DEV_PRIORITY_NORMAL
 	};
@@ -185,10 +185,11 @@ l3fwd_event_queue_setup_internal_port(uint32_t event_queue_cfg)
 			rte_panic("Error in configuring event queue\n");
 		evt_rsrc->evq.event_q_id[event_q_id] = event_q_id;
 	}
+	return 0;
 }
 
 static void
-l3fwd_rx_tx_adapter_setup_internal_port(void)
+l3fwd_rx_tx_adapter_setup_internal_port(__rte_unused bool strict_single_link)
 {
 	struct l3fwd_event_resources *evt_rsrc = l3fwd_get_eventdev_rsrc();
 	struct rte_event_eth_rx_adapter_queue_conf eth_q_conf;

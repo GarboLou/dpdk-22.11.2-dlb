@@ -130,7 +130,7 @@ setup_eventdev_generic(struct worker_data *worker_data)
 	const uint8_t dev_id = 0;
 	/* +1 stages is for a SINGLE_LINK TX stage */
 	const uint8_t nb_queues = cdata.num_stages + 1;
-	const uint8_t nb_ports = cdata.num_workers;
+	const uint8_t nb_ports = cdata.num_workers + 1;
 	struct rte_event_dev_config config = {
 			.nb_event_queues = nb_queues,
 			.nb_event_ports = nb_ports,
@@ -150,7 +150,7 @@ setup_eventdev_generic(struct worker_data *worker_data)
 			.schedule_type = cdata.queue_type,
 			.priority = RTE_EVENT_DEV_PRIORITY_NORMAL,
 			.nb_atomic_flows = 1024,
-			.nb_atomic_order_sequences = 1024,
+			.nb_atomic_order_sequences = 64,
 	};
 	struct rte_event_queue_conf tx_q_conf = {
 			.priority = RTE_EVENT_DEV_PRIORITY_HIGHEST,
@@ -440,6 +440,8 @@ init_adapters(uint16_t nb_ports)
 	if (ret)
 		rte_exit(EXIT_FAILURE, "failed to create rx adapter[%d]",
 				cdata.rx_adapter_id);
+
+	adptr_p_conf.event_port_cfg = RTE_EVENT_PORT_CFG_SINGLE_LINK;
 
 	ret = rte_event_eth_tx_adapter_create(cdata.tx_adapter_id, evdev_id,
 			&adptr_p_conf);

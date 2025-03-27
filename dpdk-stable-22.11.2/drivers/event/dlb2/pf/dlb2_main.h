@@ -9,17 +9,29 @@
 #include <rte_log.h>
 #include <rte_spinlock.h>
 #include <rte_pci.h>
-#include <bus_pci_driver.h>
-#include <rte_eal_paging.h>
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE (sysconf(_SC_PAGESIZE))
+#endif
 
 #include "base/dlb2_hw_types.h"
 #include "../dlb2_user.h"
 
-#define DLB2_EAL_PROBE_CORE 2
+#define DLB2_DEFAULT_UNREGISTER_TIMEOUT_S 5
 #define DLB2_NUM_PROBE_ENQS 1000
 #define DLB2_HCW_MEM_SIZE 8
 #define DLB2_HCW_64B_OFF 4
 #define DLB2_HCW_ALIGN_MASK 0x3F
+
+enum dlb2_device_type {
+	DLB2_PF,
+	DLB2_VF,
+	DLB2_5_PF,
+	DLB2_5_VF,
+};
+
+#define DLB2_IS_PF(dev) (dev->type == DLB2_PF || dev->type == DLB2_5_PF)
+#define DLB2_IS_VF(dev) (dev->type == DLB2_VF || dev->type == DLB2_5_VF)
 
 struct dlb2_dev;
 
@@ -34,12 +46,12 @@ struct dlb2_dev {
 	struct dlb2_hw hw;
 	/* struct list_head list; */
 	struct device *dlb2_device;
-	bool domain_reset_failed;
 	/* The enqueue_four function enqueues four HCWs (one cache-line worth)
 	 * to the HQM, using whichever mechanism is supported by the platform
 	 * on which this driver is running.
 	 */
 	void (*enqueue_four)(void *qe4, void *pp_addr);
+	bool domain_reset_failed;
 	/* The resource mutex serializes access to driver data structures and
 	 * hardware registers.
 	 */
@@ -58,7 +70,6 @@ struct dlb2_pp_thread_data {
 };
 
 struct dlb2_dev *dlb2_probe(struct rte_pci_device *pdev, const void *probe_args);
-
 
 int dlb2_pf_reset(struct dlb2_dev *dlb2_dev);
 int dlb2_pf_create_sched_domain(struct dlb2_hw *hw,
@@ -86,6 +97,10 @@ int dlb2_pf_start_domain(struct dlb2_hw *hw,
 			 u32 domain_id,
 			 struct dlb2_start_domain_args *args,
 			 struct dlb2_cmd_response *resp);
+int dlb2_pf_stop_domain(struct dlb2_hw *hw,
+			u32 domain_id,
+			struct dlb2_stop_domain_args *args,
+			struct dlb2_cmd_response *resp);
 int dlb2_pf_enable_ldb_port(struct dlb2_hw *hw,
 			    u32 domain_id,
 			    struct dlb2_enable_ldb_port_args *args,

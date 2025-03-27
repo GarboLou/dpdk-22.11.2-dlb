@@ -49,7 +49,7 @@ cnxk_inl_dev = {'Class': '08', 'Vendor': '177d', 'Device': 'a0f0,a0f1',
 hisilicon_dma = {'Class': '08', 'Vendor': '19e5', 'Device': 'a122',
                  'SVendor': None, 'SDevice': None}
 
-intel_dlb = {'Class': '0b', 'Vendor': '8086', 'Device': '270b,2710,2714',
+intel_dlb = {'Class': '0b', 'Vendor': '8086', 'Device': '270b,2710,2711,2714,2715',
              'SVendor': None, 'SDevice': None}
 intel_ioat_bdw = {'Class': '08', 'Vendor': '8086',
                   'Device': '6f20,6f21,6f22,6f23,6f24,6f25,6f26,6f27,6f2e,6f2f',
@@ -91,6 +91,7 @@ misc_devices = [cnxk_bphy, cnxk_bphy_cgx, cnxk_inl_dev,
 # global dict ethernet devices present. Dictionary indexed by PCI address.
 # Each device within this is itself a dictionary of device properties
 devices = {}
+displayed_devices = []
 # list of supported DPDK drivers
 dpdk_drivers = ["igb_uio", "vfio-pci", "uio_pci_generic"]
 # list of currently loaded kernel modules
@@ -551,14 +552,20 @@ def show_device_status(devices_type, device_name, if_field=False):
 
     # split our list of network devices into the three categories above
     for d in devices.keys():
-        if device_type_match(devices[d], devices_type):
-            if not has_driver(d):
-                no_drv.append(devices[d])
-                continue
-            if devices[d]["Driver_str"] in dpdk_drivers:
-                dpdk_drv.append(devices[d])
-            else:
-                kernel_drv.append(devices[d])
+        if d not in displayed_devices:
+            if device_type_match(devices[d], devices_type):
+                if not has_driver(d):
+                    no_drv.append(devices[d])
+                    displayed_devices.append(d)
+                    continue
+                if devices[d]["Driver_str"] in dpdk_drivers:
+                    dpdk_drv.append(devices[d])
+                    displayed_devices.append(d)
+
+                else:
+                    kernel_drv.append(devices[d])
+                    displayed_devices.append(d)
+
 
     n_devs = len(dpdk_drv) + len(kernel_drv) + len(no_drv)
 
@@ -597,14 +604,14 @@ def show_status():
     if status_dev in ["baseband", "all"]:
         show_device_status(baseband_devices, "Baseband")
 
+    if status_dev in ["event", "all"]:
+        show_device_status(eventdev_devices, "Eventdev")
+
     if status_dev in ["crypto", "all"]:
         show_device_status(crypto_devices, "Crypto")
 
     if status_dev in ["dma", "all"]:
         show_device_status(dma_devices, "DMA")
-
-    if status_dev in ["event", "all"]:
-        show_device_status(eventdev_devices, "Eventdev")
 
     if status_dev in ["mempool", "all"]:
         show_device_status(mempool_devices, "Mempool")

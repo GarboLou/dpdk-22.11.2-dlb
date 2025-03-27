@@ -15,7 +15,7 @@
 
 #include <rte_debug.h>
 #include <rte_log.h>
-#include <dev_driver.h>
+#include <rte_dev.h>
 #include <rte_devargs.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
@@ -25,7 +25,7 @@
 #include <rte_cycles.h>
 #include <rte_io.h>
 #include <rte_pci.h>
-#include <bus_pci_driver.h>
+#include <rte_bus_pci.h>
 #include <rte_eventdev.h>
 #include <eventdev_pmd.h>
 #include <eventdev_pmd_pci.h>
@@ -39,6 +39,7 @@
 #include "base/dlb2_hw_types.h"
 #include "base/dlb2_osdep.h"
 #include "base/dlb2_resource.h"
+#include "base/dlb2_regs.h"
 
 static const char *event_dlb2_pf_name = RTE_STR(EVDEV_DLB2_NAME_PMD);
 static unsigned int dlb2_qe_sa_pct = 1;
@@ -48,17 +49,21 @@ static void
 dlb2_pf_low_level_io_init(void)
 {
 	int i;
-	/* Addresses will be initialized at port create */
-	for (i = 0; i < DLB2_MAX_NUM_PORTS(DLB2_HW_V2_5); i++) {
-		/* First directed ports */
-		dlb2_port[i][DLB2_DIR_PORT].pp_addr = NULL;
-		dlb2_port[i][DLB2_DIR_PORT].cq_base = NULL;
-		dlb2_port[i][DLB2_DIR_PORT].mmaped = true;
+	int evdev_id;
 
-		/* Now load balanced ports */
-		dlb2_port[i][DLB2_LDB_PORT].pp_addr = NULL;
-		dlb2_port[i][DLB2_LDB_PORT].cq_base = NULL;
-		dlb2_port[i][DLB2_LDB_PORT].mmaped = true;
+	/* Addresses will be initialized at port create */
+	for (evdev_id = 0; evdev_id < RTE_EVENT_MAX_DEVS; evdev_id++) {
+		for (i = 0; i < DLB2_MAX_NUM_PORTS(DLB2_HW_V2_5); i++) {
+			/* First directed ports */
+			dlb2_port[evdev_id][i][DLB2_DIR_PORT].pp_addr = NULL;
+			dlb2_port[evdev_id][i][DLB2_DIR_PORT].cq_base = NULL;
+			dlb2_port[evdev_id][i][DLB2_DIR_PORT].mmaped = true;
+
+			/* Now load balanced ports */
+			dlb2_port[evdev_id][i][DLB2_LDB_PORT].pp_addr = NULL;
+			dlb2_port[evdev_id][i][DLB2_LDB_PORT].cq_base = NULL;
+			dlb2_port[evdev_id][i][DLB2_LDB_PORT].mmaped = true;
+		}
 	}
 }
 
@@ -73,11 +78,13 @@ dlb2_pf_open(struct dlb2_hw_dev *handle, const char *name)
 
 static int
 dlb2_pf_get_device_version(struct dlb2_hw_dev *handle,
-			   uint8_t *revision)
+			   uint8_t *revision,
+			   uint8_t *version)
 {
 	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
 
 	*revision = dlb2_dev->revision;
+	*version = dlb2_dev->version;
 
 	return 0;
 }
@@ -102,14 +109,16 @@ static void dlb2_pf_calc_arbiter_weights(u8 *weight,
 		weight[i] = weight[i + 1] - val;
 }
 
-
 static void
 dlb2_pf_hardware_init(struct dlb2_hw_dev *handle)
 {
 	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
+	int rate_limit = DLB2_WB_CNTL_RATE_LIMIT;
 
 	dlb2_hw_enable_sparse_ldb_cq_mode(&dlb2_dev->hw);
 	dlb2_hw_enable_sparse_dir_cq_mode(&dlb2_dev->hw);
+	dlb2_hw_enable_ldb_sched_perf_ctrl(&dlb2_dev->hw);
+	dlb2_hw_set_rate_limit(&dlb2_dev->hw, rate_limit);
 
 	/* Configure arbitration weights for QE selection */
 	if (dlb2_qe_sa_pct <= 100) {
@@ -130,7 +139,6 @@ dlb2_pf_hardware_init(struct dlb2_hw_dev *handle)
 
 		dlb2_hw_set_qid_arbiter_weights(&dlb2_dev->hw, weight);
 	}
-
 }
 
 static int
@@ -183,16 +191,13 @@ done:
 	return ret;
 }
 
-static void
+static int
 dlb2_pf_domain_reset(struct dlb2_eventdev *dlb2)
 {
 	struct dlb2_dev *dlb2_dev;
-	int ret;
 
 	dlb2_dev = (struct dlb2_dev *)dlb2->qm_instance.pf_dev;
-	ret = dlb2_pf_reset_domain(&dlb2_dev->hw, dlb2->qm_instance.domain_id);
-	if (ret)
-		DLB2_LOG_ERR("dlb2_pf_reset_domain err %d", ret);
+	return dlb2_pf_reset_domain(&dlb2_dev->hw, dlb2->qm_instance.domain_id);
 }
 
 static int
@@ -301,7 +306,8 @@ dlb2_alloc_coherent_aligned(const struct rte_memzone **mz, uintptr_t *phys,
 static int
 dlb2_pf_ldb_port_create(struct dlb2_hw_dev *handle,
 			struct dlb2_create_ldb_port_args *cfg,
-			enum dlb2_cq_poll_modes poll_mode)
+			enum dlb2_cq_poll_modes poll_mode,
+			uint8_t evdev_id)
 {
 	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
 	struct dlb2_cmd_response response = {0};
@@ -329,7 +335,7 @@ dlb2_pf_ldb_port_create(struct dlb2_hw_dev *handle,
 	alloc_sz = RTE_CACHE_LINE_ROUNDUP(alloc_sz);
 
 	port_base = dlb2_alloc_coherent_aligned(&mz, &cq_base, alloc_sz,
-						rte_mem_page_size());
+						PAGE_SIZE);
 	if (port_base == NULL)
 		return -ENOMEM;
 
@@ -347,21 +353,23 @@ dlb2_pf_ldb_port_create(struct dlb2_hw_dev *handle,
 				      cfg,
 				      cq_base,
 				      &response);
+	cfg->response = response;
+
 	if (ret)
 		goto create_port_err;
 
 	pp_base = (uintptr_t)dlb2_dev->hw.func_kva + PP_BASE(is_dir);
-	dlb2_port[response.id][DLB2_LDB_PORT].pp_addr =
-		(void *)(pp_base + (rte_mem_page_size() * response.id));
+	dlb2_port[evdev_id][response.id][DLB2_LDB_PORT].pp_addr =
+		(void *)(pp_base + (PAGE_SIZE * response.id));
 
-	dlb2_port[response.id][DLB2_LDB_PORT].cq_base = (void *)(port_base);
+	dlb2_port[evdev_id][response.id][DLB2_LDB_PORT].cq_base =
+		(void *)(port_base);
+
 	memset(&port_memory, 0, sizeof(port_memory));
 
-	dlb2_port[response.id][DLB2_LDB_PORT].mz = mz;
+	dlb2_port[evdev_id][response.id][DLB2_LDB_PORT].mz = mz;
 
 	dlb2_list_init_head(&port_memory.list);
-
-	cfg->response = response;
 
 	return 0;
 
@@ -377,7 +385,8 @@ create_port_err:
 static int
 dlb2_pf_dir_port_create(struct dlb2_hw_dev *handle,
 			struct dlb2_create_dir_port_args *cfg,
-			enum dlb2_cq_poll_modes poll_mode)
+			enum dlb2_cq_poll_modes poll_mode,
+			uint8_t evdev_id)
 {
 	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
 	struct dlb2_cmd_response response = {0};
@@ -404,7 +413,7 @@ dlb2_pf_dir_port_create(struct dlb2_hw_dev *handle,
 	alloc_sz = RTE_CACHE_LINE_ROUNDUP(alloc_sz);
 
 	port_base = dlb2_alloc_coherent_aligned(&mz, &cq_base, alloc_sz,
-						rte_mem_page_size());
+						PAGE_SIZE);
 	if (port_base == NULL)
 		return -ENOMEM;
 
@@ -422,22 +431,23 @@ dlb2_pf_dir_port_create(struct dlb2_hw_dev *handle,
 				      cfg,
 				      cq_base,
 				      &response);
+	cfg->response = response;
+
 	if (ret)
 		goto create_port_err;
 
 	pp_base = (uintptr_t)dlb2_dev->hw.func_kva + PP_BASE(is_dir);
-	dlb2_port[response.id][DLB2_DIR_PORT].pp_addr =
-		(void *)(pp_base + (rte_mem_page_size() * response.id));
+	dlb2_port[evdev_id][response.id][DLB2_DIR_PORT].pp_addr =
+		(void *)(pp_base + (PAGE_SIZE * response.id));
 
-	dlb2_port[response.id][DLB2_DIR_PORT].cq_base =
+	dlb2_port[evdev_id][response.id][DLB2_DIR_PORT].cq_base =
 		(void *)(port_base);
 	memset(&port_memory, 0, sizeof(port_memory));
 
-	dlb2_port[response.id][DLB2_DIR_PORT].mz = mz;
+	dlb2_port[evdev_id][response.id][DLB2_DIR_PORT].mz = mz;
 
 	dlb2_list_init_head(&port_memory.list);
 
-	cfg->response = response;
 
 	return 0;
 
@@ -573,6 +583,29 @@ dlb2_pf_sched_domain_start(struct dlb2_hw_dev *handle,
 }
 
 static int
+dlb2_pf_sched_domain_stop(struct dlb2_hw_dev *handle,
+			   struct dlb2_stop_domain_args *cfg)
+{
+	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
+	struct dlb2_cmd_response response = {0};
+	int ret;
+
+	DLB2_INFO(dev->dlb2_device, "Entering %s()\n", __func__);
+
+	ret = dlb2_pf_stop_domain(&dlb2_dev->hw,
+				   handle->domain_id,
+				   cfg,
+				   &response);
+
+	cfg->response = response;
+
+	DLB2_INFO(dev->dlb2_device, "Exiting %s() with ret=%d\n",
+		  __func__, ret);
+
+	return ret;
+}
+
+static int
 dlb2_pf_get_ldb_queue_depth(struct dlb2_hw_dev *handle,
 			    struct dlb2_get_ldb_queue_depth_args *args)
 {
@@ -623,6 +656,62 @@ dlb2_pf_get_dir_queue_depth(struct dlb2_hw_dev *handle,
 }
 
 static int
+dlb2_pf_get_sched_idle_counts(struct dlb2_hw_dev *handle,
+			      void *idle_counts)
+{
+	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
+	struct dlb2_hw_sched_idle_counts *data = idle_counts;
+	struct dlb2_hw_sched_idle_counts prev_data = {0};
+	int ret = 0;
+
+	/* Take one snapshot of the idle counters */
+	ret = dlb2_read_sched_idle_counts(&dlb2_dev->hw, data);
+	memcpy(&prev_data, data, sizeof(prev_data));
+
+	/* Interval between two readings */
+	rte_delay_ms(DLB2_IDLE_CNT_INTERVAL);
+
+	/* Take another snapshot of the counters after the timeout */
+	ret = dlb2_read_sched_idle_counts(&dlb2_dev->hw, data);
+	if (ret != 0) {
+		DLB2_LOG_ERR("Failed to read scheduler idle counters");
+		return -EINVAL;
+	}
+
+	/* Compute diff of the counters */
+	data->ldb_perf_nowork_idle_cnt -= prev_data.ldb_perf_nowork_idle_cnt;
+	data->ldb_perf_nospace_idle_cnt -= prev_data.ldb_perf_nospace_idle_cnt;
+	data->ldb_perf_sched_cnt -= prev_data.ldb_perf_sched_cnt;
+	data->ldb_perf_pfriction_idle_cnt -= prev_data.ldb_perf_pfriction_idle_cnt;
+	data->ldb_perf_iflimit_idle_cnt -= prev_data.ldb_perf_iflimit_idle_cnt;
+	data->ldb_perf_fidlimit_idle_cnt -= prev_data.ldb_perf_fidlimit_idle_cnt;
+	data->perf_proc_on_cnt -= prev_data.perf_proc_on_cnt;
+	data->perf_clk_on_cnt -= prev_data.perf_clk_on_cnt;
+	data->hcw_err_cnt -= prev_data.hcw_err_cnt;
+
+	return ret;
+}
+
+static int
+dlb2_pf_set_cos_bandwidth(struct dlb2_hw_dev *handle,
+			  struct dlb2_set_cos_bw_args *args)
+{
+	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
+	int ret = 0;
+
+	DLB2_INFO(dev->dlb2_device, "Entering %s()\n", __func__);
+
+	ret = dlb2_hw_set_cos_bandwidth(&dlb2_dev->hw,
+					args->cos_id,
+					args->bandwidth);
+
+	DLB2_INFO(dev->dlb2_device, "Exiting %s() with ret=%d\n",
+		  __func__, ret);
+
+	return ret;
+}
+
+static int
 dlb2_pf_enable_cq_weight(struct dlb2_hw_dev *handle,
 			 struct dlb2_enable_cq_weight_args *args)
 {
@@ -647,17 +736,58 @@ dlb2_pf_enable_cq_weight(struct dlb2_hw_dev *handle,
 }
 
 static int
-dlb2_pf_set_cos_bandwidth(struct dlb2_hw_dev *handle,
-			  struct dlb2_set_cos_bw_args *args)
+dlb2_pf_set_cq_inflight_ctrl(struct dlb2_hw_dev *handle,
+			     struct dlb2_cq_inflight_ctrl_args *args)
 {
 	struct dlb2_dev *dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
+	struct dlb2_cmd_response response = {0};
 	int ret = 0;
 
 	DLB2_INFO(dev->dlb2_device, "Entering %s()\n", __func__);
 
-	ret = dlb2_hw_set_cos_bandwidth(&dlb2_dev->hw,
-					args->cos_id,
-					args->bandwidth);
+	ret = dlb2_hw_set_cq_inflight_ctrl(&dlb2_dev->hw, handle->domain_id,
+					   args, &response, false, 0);
+	args->response = response;
+
+	DLB2_INFO(dev->dlb2_device, "Exiting %s() with ret=%d\n",
+		  __func__, ret);
+
+	return ret;
+}
+static int dlb2_pf_port_ctrl(struct dlb2_port *qm_port, bool enable)
+{
+	struct dlb2_hw_dev *handle = &qm_port->dlb2->qm_instance;
+	struct dlb2_cmd_response response = {0};
+	struct dlb2_dev *dlb2_dev;
+	int ret = 0;
+
+	dlb2_dev = (struct dlb2_dev *)handle->pf_dev;
+
+	if (PORT_TYPE(qm_port) == DLB2_LDB_PORT) {
+		if (enable) {
+			struct dlb2_enable_ldb_port_args args = {.port_id = qm_port->id};
+
+			ret = dlb2_hw_enable_ldb_port(&dlb2_dev->hw, handle->domain_id,
+						      &args, &response, false, 0);
+		} else {
+			struct dlb2_disable_ldb_port_args args = {.port_id = qm_port->id};
+
+			ret = dlb2_hw_disable_ldb_port(&dlb2_dev->hw, handle->domain_id,
+						      &args, &response, false, 0);
+		}
+	} else {
+		if (enable) {
+			struct dlb2_enable_dir_port_args args = {.port_id = qm_port->id};
+
+			ret = dlb2_hw_enable_dir_port(&dlb2_dev->hw, handle->domain_id,
+						      &args, &response, false, 0);
+		} else {
+			struct dlb2_disable_dir_port_args args = {.port_id = qm_port->id};
+
+			ret = dlb2_hw_disable_dir_port(&dlb2_dev->hw, handle->domain_id,
+						      &args, &response, false, 0);
+		}
+	}
 
 	DLB2_INFO(dev->dlb2_device, "Exiting %s() with ret=%d\n",
 		  __func__, ret);
@@ -685,12 +815,16 @@ dlb2_pf_iface_fn_ptrs_init(void)
 	dlb2_iface_get_ldb_queue_depth = dlb2_pf_get_ldb_queue_depth;
 	dlb2_iface_get_dir_queue_depth = dlb2_pf_get_dir_queue_depth;
 	dlb2_iface_sched_domain_start = dlb2_pf_sched_domain_start;
+	dlb2_iface_sched_domain_stop = dlb2_pf_sched_domain_stop;
 	dlb2_iface_pending_port_unmaps = dlb2_pf_pending_port_unmaps;
 	dlb2_iface_get_sn_allocation = dlb2_pf_get_sn_allocation;
 	dlb2_iface_set_sn_allocation = dlb2_pf_set_sn_allocation;
 	dlb2_iface_get_sn_occupancy = dlb2_pf_get_sn_occupancy;
+	dlb2_iface_get_sched_idle_counts = dlb2_pf_get_sched_idle_counts;
 	dlb2_iface_enable_cq_weight = dlb2_pf_enable_cq_weight;
 	dlb2_iface_set_cos_bw = dlb2_pf_set_cos_bandwidth;
+	dlb2_iface_set_cq_inflight_ctrl = dlb2_pf_set_cq_inflight_ctrl;
+	dlb2_iface_port_ctrl = dlb2_pf_port_ctrl;
 }
 
 /* PCI DEV HOOKS */
@@ -702,19 +836,25 @@ dlb2_eventdev_pci_init(struct rte_eventdev *eventdev)
 	struct dlb2_devargs dlb2_args = {
 		.socket_id = rte_socket_id(),
 		.max_num_events = DLB2_MAX_NUM_LDB_CREDITS,
-		.producer_coremask = NULL,
+		.producer_coremask = {'\0'},
 		.num_dir_credits_override = -1,
 		.qid_depth_thresholds = { {0} },
-		.poll_interval = DLB2_POLL_INTERVAL_DEFAULT,
-		.sw_credit_quanta = DLB2_SW_CREDIT_QUANTA_DEFAULT,
-		.hw_credit_quanta = DLB2_SW_CREDIT_BATCH_SZ,
+		.sw_credit_quanta = {DLB2_SW_CREDIT_QUANTA_DEFAULT,
+			DLB2_SW_CREDIT_P_QUANTA_DEFAULT,
+			DLB2_SW_CREDIT_C_QUANTA_DEFAULT},
+		.hw_credit_quanta = {DLB2_SW_CREDIT_BATCH_SZ,
+			DLB2_SW_CREDIT_P_BATCH_SZ,
+			DLB2_SW_CREDIT_C_BATCH_SZ},
 		.default_depth_thresh = DLB2_DEPTH_THRESH_DEFAULT,
 		.max_cq_depth = DLB2_DEFAULT_CQ_DEPTH,
-		.max_enq_depth = DLB2_MAX_ENQUEUE_DEPTH
+		.max_enq_depth = DLB2_MAX_ENQUEUE_DEPTH,
+		.use_default_hl = true,
+		.alloc_hl_entries = 0
 	};
 	struct dlb2_eventdev *dlb2;
-	int q;
+	struct dlb2_dev *dlb2_dev;
 	const void *probe_args = NULL;
+	int q;
 
 	DLB2_LOG_DBG("Enter with dev_id=%d socket_id=%d",
 		     eventdev->data->dev_id, eventdev->data->socket_id);
@@ -727,8 +867,11 @@ dlb2_eventdev_pci_init(struct rte_eventdev *eventdev)
 	pci_dev = RTE_DEV_TO_PCI(eventdev->dev);
 
 	if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
-		dlb2 = dlb2_pmd_priv(eventdev); /* rte_zmalloc_socket mem */
+		dlb2 = dlb2_pmd_priv(eventdev);
 		dlb2->version = DLB2_HW_DEVICE_FROM_PCI_ID(pci_dev);
+		if (dlb2->version == DLB2_HW_V2_5)
+			dlb2_args.max_num_events =
+				DLB2_MAX_NUM_CREDITS(dlb2->version);
 
 		/* Were we invoked with runtime parameters? */
 		if (pci_dev->device.devargs) {
@@ -754,14 +897,21 @@ dlb2_eventdev_pci_init(struct rte_eventdev *eventdev)
 			goto dlb2_probe_failed;
 		}
 
+		dlb2_dev = (struct dlb2_dev *)dlb2->qm_instance.pf_dev;
+		dlb2_dev->version = dlb2->version;
+
 		ret = dlb2_primary_eventdev_probe(eventdev,
 						  event_dlb2_pf_name,
-						  &dlb2_args);
+						  &dlb2_args,
+						  DLB2_NOT_VDEV);
 	} else {
 		dlb2 = dlb2_pmd_priv(eventdev);
 		dlb2->version = DLB2_HW_DEVICE_FROM_PCI_ID(pci_dev);
+		dlb2_dev = (struct dlb2_dev *)dlb2->qm_instance.pf_dev;
+		dlb2_dev->version = dlb2->version;
 		ret = dlb2_secondary_eventdev_probe(eventdev,
-						    event_dlb2_pf_name);
+						    event_dlb2_pf_name,
+						    DLB2_NOT_VDEV);
 	}
 	if (ret)
 		goto dlb2_probe_failed;
@@ -799,6 +949,8 @@ static const struct rte_pci_id pci_id_dlb2_5_map[] = {
 	},
 };
 
+#define DLB2_PF_EVENT_NAME_LEN 22 /* "dlb2_event" cat PCI addr */
+
 static int
 event_dlb2_pci_probe(struct rte_pci_driver *pci_drv,
 		     struct rte_pci_device *pci_dev)
@@ -806,9 +958,9 @@ event_dlb2_pci_probe(struct rte_pci_driver *pci_drv,
 	int ret;
 
 	ret = rte_event_pmd_pci_probe_named(pci_drv, pci_dev,
-					     sizeof(struct dlb2_eventdev),
-					     dlb2_eventdev_pci_init,
-					     event_dlb2_pf_name);
+					    sizeof(struct dlb2_eventdev),
+					    dlb2_eventdev_pci_init,
+					    pci_dev->device.name);
 	if (ret) {
 		DLB2_LOG_INFO("rte_event_pmd_pci_probe_named() failed, "
 				"ret=%d\n", ret);
@@ -842,7 +994,7 @@ event_dlb2_5_pci_probe(struct rte_pci_driver *pci_drv,
 	ret = rte_event_pmd_pci_probe_named(pci_drv, pci_dev,
 					    sizeof(struct dlb2_eventdev),
 					    dlb2_eventdev_pci_init,
-					    event_dlb2_pf_name);
+					    pci_dev->device.name);
 	if (ret) {
 		DLB2_LOG_INFO("rte_event_pmd_pci_probe_named() failed, "
 				"ret=%d\n", ret);

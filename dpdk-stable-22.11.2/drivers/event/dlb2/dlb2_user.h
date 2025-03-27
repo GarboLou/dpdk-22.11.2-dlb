@@ -18,7 +18,6 @@ enum dlb2_error {
 	DLB2_ST_LDB_QUEUES_UNAVAILABLE,
 	DLB2_ST_LDB_CREDITS_UNAVAILABLE,
 	DLB2_ST_DIR_CREDITS_UNAVAILABLE,
-	DLB2_ST_CREDITS_UNAVAILABLE,
 	DLB2_ST_SEQUENCE_NUMBERS_UNAVAILABLE,
 	DLB2_ST_INVALID_DOMAIN_ID,
 	DLB2_ST_INVALID_QID_INFLIGHT_ALLOCATION,
@@ -48,6 +47,7 @@ enum dlb2_error {
 	DLB2_ST_INVALID_LOCK_ID_COMP_LEVEL,
 	DLB2_ST_INVALID_COS_ID,
 	DLB2_ST_INVALID_CQ_WEIGHT_LIMIT,
+	DLB2_ST_SN_SLOTS_UNAVAILABLE,
 	DLB2_ST_FEATURE_UNAVAILABLE,
 };
 
@@ -60,7 +60,6 @@ static const char dlb2_error_strings[][128] = {
 	"DLB2_ST_LDB_QUEUES_UNAVAILABLE",
 	"DLB2_ST_LDB_CREDITS_UNAVAILABLE",
 	"DLB2_ST_DIR_CREDITS_UNAVAILABLE",
-	"DLB2_ST_CREDITS_UNAVAILABLE",
 	"DLB2_ST_SEQUENCE_NUMBERS_UNAVAILABLE",
 	"DLB2_ST_INVALID_DOMAIN_ID",
 	"DLB2_ST_INVALID_QID_INFLIGHT_ALLOCATION",
@@ -90,6 +89,7 @@ static const char dlb2_error_strings[][128] = {
 	"DLB2_ST_INVALID_LOCK_ID_COMP_LEVEL",
 	"DLB2_ST_INVALID_COS_ID",
 	"DLB2_ST_INVALID_CQ_WEIGHT_LIMIT",
+	"DLB2_ST_SN_SLOTS_UNAVAILABLE",
 	"DLB2_ST_FEATURE_UNAVAILABLE",
 };
 
@@ -98,9 +98,9 @@ struct dlb2_cmd_response {
 	__u32 id;
 };
 
-/*******************/
-/* 'dlb2' commands */
-/*******************/
+/********************************/
+/* 'dlb2' device file commands */
+/********************************/
 
 #define DLB2_DEVICE_VERSION(x) (((x) >> 8) & 0xFF)
 #define DLB2_DEVICE_REVISION(x) ((x) & 0xFF)
@@ -135,7 +135,7 @@ struct dlb2_get_device_version_args {
  * Input parameters:
  * - num_ldb_queues: Number of load-balanced queues.
  * - num_ldb_ports: Number of load-balanced ports that can be allocated from
- *	any class-of-service with available ports.
+ *	from any class-of-service with available ports.
  * - num_cos_ldb_ports[4]: Number of load-balanced ports from
  *	classes-of-service 0-3.
  * - num_dir_ports: Number of directed ports. A directed port has one directed
@@ -155,6 +155,10 @@ struct dlb2_get_device_version_args {
  *	class-of-service N to satisfy the num_ldb_ports_cosN argument. If
  *	unset, attempt to fulfill num_ldb_ports_cosN arguments from other
  *	classes-of-service if class N does not contain enough free ports.
+ * - num_sn_slots[2]: number of sequence number slots from group 0 and 1.
+ * -  pcore_mask: Producer coremask for the domain. Bit map of cores on which
+ *   producer threads for this domain will run.
+ * -  core_mask: EAL coremask
  * - padding1: Reserved for future use.
  *
  * Output parameters:
@@ -187,6 +191,9 @@ struct dlb2_create_sched_domain_args {
 	};
 	__u8 cos_strict;
 	__u8 padding1[3];
+	__u32 num_sn_slots[2];
+	__u64 pcore_bmp[RTE_MAX_LCORE/__BITS_PER_LONG];
+	__u64 core_bmp[RTE_MAX_LCORE/__BITS_PER_LONG];
 };
 
 /*
@@ -208,6 +215,8 @@ struct dlb2_create_sched_domain_args {
  *	contiguous range of history list entries.
  * - num_ldb_credits: Amount of available load-balanced QE storage.
  * - num_dir_credits: Amount of available directed QE storage.
+ * - num_sn_slots[2]: number of available sequence number slots from group
+ *      0 and 1.
  * - response.status: Detailed error code. In certain cases, such as if the
  *	ioctl request arg is invalid, the driver won't set status.
  */
@@ -231,6 +240,7 @@ struct dlb2_get_num_resources_args {
 			__u32 num_credits;
 		};
 	};
+	__u32 num_sn_slots[2];
 };
 
 /*
@@ -365,9 +375,190 @@ struct dlb2_query_cq_poll_mode_args {
 	struct dlb2_cmd_response response;
 };
 
-/********************************/
-/* 'scheduling domain' commands */
-/********************************/
+/*
+ * DLB2_CMD_GET_HW_REG: Read the contents of a HW register
+ *
+ * Input parameters:
+ * - reg_addr: 32 bit address of HW register
+ *
+ * Output parameters:
+ * - reg_val: Contents of a HW register
+ * - response.status: Detailed error code. In certain cases, such as if the
+ *     ioctl request arg is invalid, the driver won't set status.
+ */
+struct dlb2_xstats_args {
+	/* Output parameters */
+	struct dlb2_cmd_response response;
+	__u64 xstats_val;
+	/* Input parameters */
+	__u32 xstats_type;
+	__u32 xstats_id;
+};
+enum dlb2_xtats_type {
+	DEVICE_XSTATS= 0x0,
+	LDB_QUEUE_XSTATS,
+	LDB_PORT_XSTATS,
+	DIR_PQ_XSTATS,
+	MAX_XSTATS
+};
+#define XSTATS_BASE(id) (id << 16)
+
+enum dlb2_ldb_queue_xstats {
+	DLB_CFG_QID_LDB_INFLIGHT_COUNT = XSTATS_BASE(LDB_QUEUE_XSTATS),
+	DLB_CFG_QID_LDB_INFLIGHT_LIMIT,
+	DLB_CFG_QID_ATM_ACTIVE,
+	DLB_CFG_QID_ATM_DEPTH_THRSH,
+	DLB_CFG_QID_NALB_DEPTH_THRSH,
+	DLB_CFG_QID_ATQ_ENQ_CNT,
+	DLB_CFG_QID_LDB_ENQ_CNT,
+};
+
+enum dlb2_ldb_port_xstats {
+	DLB_CFG_CQ_LDB_DEPTH = XSTATS_BASE(LDB_PORT_XSTATS),
+	DLB_CFG_CQ_LDB_TOKEN_COUNT,
+	DLB_CFG_CQ_LDB_TOKEN_DEPTH_SELECT,
+	DLB_CFG_CQ_LDB_INFLIGHT_COUNT,
+};
+
+enum dlb2_dir_pq_xstats {
+	DLB_CFG_CQ_DIR_TOKEN_DEPTH_SELECT = XSTATS_BASE(DIR_PQ_XSTATS),
+	DLB_CFG_CQ_DIR_DEPTH,
+	DLB_CFG_QID_DIR_DEPTH_THRSH,
+	DLB_CFG_QID_DIR_ENQ_CNT,
+};
+
+enum dlb2_user_interface_commands {
+	DLB2_CMD_GET_DEVICE_VERSION,
+	DLB2_CMD_CREATE_SCHED_DOMAIN,
+	DLB2_CMD_GET_NUM_RESOURCES,
+	DLB2_CMD_RESERVED1,
+	DLB2_CMD_RESERVED2,
+	DLB2_CMD_SET_SN_ALLOCATION,
+	DLB2_CMD_GET_SN_ALLOCATION,
+	DLB2_CMD_SET_COS_BW,
+	DLB2_CMD_GET_COS_BW,
+	DLB2_CMD_GET_SN_OCCUPANCY,
+	DLB2_CMD_QUERY_CQ_POLL_MODE,
+	DLB2_CMD_GET_XSTATS,
+
+	/* NUM_DLB2_CMD must be last */
+	NUM_DLB2_CMD,
+};
+
+/*******************************/
+/* 'domain' device file alerts */
+/*******************************/
+
+/*
+ * Scheduling domain device files can be read to receive domain-specific
+ * notifications, for alerts such as hardware errors or device reset.
+ *
+ * Each alert is encoded in a 16B message. The first 8B contains the alert ID,
+ * and the second 8B is optional and contains additional information.
+ * Applications should cast read data to a struct dlb2_domain_alert, and
+ * interpret the struct's alert_id according to dlb2_domain_alert_id. The read
+ * length must be 16B, or the function will return -EINVAL.
+ *
+ * Reads are destructive, and in the case of multiple file descriptors for the
+ * same domain device file, an alert will be read by only one of the file
+ * descriptors.
+ *
+ * The driver stores alerts in a fixed-size alert ring until they are read. If
+ * the alert ring fills completely, subsequent alerts will be dropped. It is
+ * recommended that DLB2 applications dedicate a thread to perform blocking
+ * reads on the device file.
+ */
+enum dlb2_domain_alert_id {
+	/*
+	 * Software issued an illegal enqueue for a port in this domain. An
+	 * illegal enqueue could be:
+	 * - Illegal (excess) completion
+	 * - Illegal fragment
+	 * - Insufficient credits
+	 * aux_alert_data[7:0] contains the port ID, and aux_alert_data[15:8]
+	 * contains a flag indicating whether the port is load-balanced (1) or
+	 * directed (0).
+	 */
+	DLB2_DOMAIN_ALERT_PP_ILLEGAL_ENQ,
+	/*
+	 * Software issued excess CQ token pops for a port in this domain.
+	 * aux_alert_data[7:0] contains the port ID, and aux_alert_data[15:8]
+	 * contains a flag indicating whether the port is load-balanced (1) or
+	 * directed (0).
+	 */
+	DLB2_DOMAIN_ALERT_PP_EXCESS_TOKEN_POPS,
+	/*
+	 * A enqueue contained either an invalid command encoding or a REL,
+	 * REL_T, RLS, FWD, FWD_T, FRAG, or FRAG_T from a directed port.
+	 *
+	 * aux_alert_data[7:0] contains the port ID, and aux_alert_data[15:8]
+	 * contains a flag indicating whether the port is load-balanced (1) or
+	 * directed (0).
+	 */
+	DLB2_DOMAIN_ALERT_ILLEGAL_HCW,
+	/*
+	 * The QID must be valid and less than 128.
+	 *
+	 * aux_alert_data[7:0] contains the port ID, and aux_alert_data[15:8]
+	 * contains a flag indicating whether the port is load-balanced (1) or
+	 * directed (0).
+	 */
+	DLB2_DOMAIN_ALERT_ILLEGAL_QID,
+	/*
+	 * An enqueue went to a disabled QID.
+	 *
+	 * aux_alert_data[7:0] contains the port ID, and aux_alert_data[15:8]
+	 * contains a flag indicating whether the port is load-balanced (1) or
+	 * directed (0).
+	 */
+	DLB2_DOMAIN_ALERT_DISABLED_QID,
+	/*
+	 * The device containing this domain was reset. All applications using
+	 * the device need to exit for the driver to complete the reset
+	 * procedure.
+	 *
+	 * aux_alert_data doesn't contain any information for this alert.
+	 */
+	DLB2_DOMAIN_ALERT_DEVICE_RESET,
+	/*
+	 * User-space has enqueued an alert.
+	 *
+	 * aux_alert_data contains user-provided data.
+	 */
+	DLB2_DOMAIN_ALERT_USER,
+	/*
+	 * The watchdog timer fired for the specified port. This occurs if its
+	 * CQ was not serviced for a large amount of time, likely indicating a
+	 * hung thread.
+	 * aux_alert_data[7:0] contains the port ID, and aux_alert_data[15:8]
+	 * contains a flag indicating whether the port is load-balanced (1) or
+	 * directed (0).
+	 */
+	DLB2_DOMAIN_ALERT_CQ_WATCHDOG_TIMEOUT,
+
+	/* Number of DLB2 domain alerts */
+	NUM_DLB2_DOMAIN_ALERTS
+};
+
+static const char dlb2_domain_alert_strings[][128] = {
+	"DLB2_DOMAIN_ALERT_PP_ILLEGAL_ENQ",
+	"DLB2_DOMAIN_ALERT_PP_EXCESS_TOKEN_POPS",
+	"DLB2_DOMAIN_ALERT_ILLEGAL_HCW",
+	"DLB2_DOMAIN_ALERT_ILLEGAL_QID",
+	"DLB2_DOMAIN_ALERT_DISABLED_QID",
+	"DLB2_DOMAIN_ALERT_DEVICE_RESET",
+	"DLB2_DOMAIN_ALERT_USER",
+	"DLB2_DOMAIN_ALERT_CQ_WATCHDOG_TIMEOUT",
+};
+
+struct dlb2_domain_alert {
+	__u64 alert_id;
+	__u64 aux_alert_data;
+};
+
+/*********************************/
+/* 'domain' device file commands */
+/*********************************/
 
 /*
  * DLB2_DOMAIN_CMD_CREATE_LDB_QUEUE: Configure a load-balanced queue.
@@ -450,7 +641,7 @@ struct dlb2_create_dir_queue_args {
  * - num_hist_list_entries: Number of history list entries. This must be
  *	greater than or equal cq_depth.
  * - cos_id: class-of-service to allocate this port from. Must be between 0 and
- *	3, inclusive. Should be 255 if default.
+ *	3, inclusive.
  * - cos_strict: If set, return an error if there are no available ports in the
  *	requested class-of-service. Else, allocate the port from a different
  *	class-of-service if the requested class has no available ports.
@@ -472,6 +663,8 @@ struct dlb2_create_ldb_port_args {
 	__u16 cq_history_list_size;
 	__u8 cos_id;
 	__u8 cos_strict;
+	__u8 enable_inflight_ctrl;
+	__u16 inflight_threshold;
 };
 
 /*
@@ -485,6 +678,8 @@ struct dlb2_create_ldb_port_args {
  * - qid: Queue ID. If the corresponding directed queue is already created,
  *	specify its ID here. Else this argument must be 0xFFFFFFFF to indicate
  *	that the port is being created before the queue.
+ * - is_producer: If this port is used as a producer i.e., events will be
+ *   primarily enqueued from this port
  *
  * Output parameters:
  * - response.status: Detailed error code. In certain cases, such as if the
@@ -514,6 +709,22 @@ struct dlb2_create_dir_port_args {
  *	ioctl request arg is invalid, the driver won't set status.
  */
 struct dlb2_start_domain_args {
+	/* Output parameters */
+	struct dlb2_cmd_response response;
+};
+
+/*
+ * DLB2_DOMAIN_CMD_STOP_DOMAIN: Stop scheduling of a domain. Scheduling can be
+ *	resumed by calling DLB2_DOMAIN_CMD_START_DOMAIN. Sending QEs into the
+ *	device after calling this ioctl will result in undefined behavior.
+ * Input parameters:
+ * - (None)
+ *
+ * Output parameters:
+ * - response.status: Detailed error code. In certain cases, such as if the
+ *	ioctl request arg is invalid, the driver won't set status.
+ */
+struct dlb2_stop_domain_args {
 	/* Output parameters */
 	struct dlb2_cmd_response response;
 };
@@ -632,6 +843,56 @@ struct dlb2_disable_dir_port_args {
 };
 
 /*
+ * DLB2_DOMAIN_CMD_BLOCK_ON_CQ_INTERRUPT: Block on a CQ interrupt until a QE
+ *	arrives for the specified port. If a QE is already present, the ioctl
+ *	will immediately return.
+ *
+ *	Note: Only one thread can block on a CQ's interrupt at a time. Doing
+ *	otherwise can result in hung threads.
+ *
+ * Input parameters:
+ * - port_id: Port ID.
+ * - is_ldb: True if the port is load-balanced, false otherwise.
+ * - arm: Tell the driver to arm the interrupt.
+ * - cq_gen: Current CQ generation bit.
+ * - padding0: Reserved for future use.
+ * - cq_va: VA of the CQ entry where the next QE will be placed.
+ *
+ * Output parameters:
+ * - response.status: Detailed error code. In certain cases, such as if the
+ *	ioctl request arg is invalid, the driver won't set status.
+ */
+struct dlb2_block_on_cq_interrupt_args {
+	/* Output parameters */
+	struct dlb2_cmd_response response;
+	/* Input parameters */
+	__u32 port_id;
+	__u8 is_ldb;
+	__u8 arm;
+	__u8 cq_gen;
+	__u8 padding0;
+	__u64 cq_va;
+};
+
+/*
+ * DLB2_DOMAIN_CMD_ENQUEUE_DOMAIN_ALERT: Enqueue a domain alert that will be
+ *	read by one reader thread.
+ *
+ * Input parameters:
+ * - aux_alert_data: user-defined auxiliary data.
+ *
+ * Output parameters:
+ * - response.status: Detailed error code. In certain cases, such as if the
+ *	ioctl request arg is invalid, the driver won't set status.
+ */
+struct dlb2_enqueue_domain_alert_args {
+	/* Output parameters */
+	struct dlb2_cmd_response response;
+	/* Input parameters */
+	__u64 aux_alert_data;
+};
+
+/*
  * DLB2_DOMAIN_CMD_GET_LDB_QUEUE_DEPTH: Get a load-balanced queue's depth.
  * Input parameters:
  * - queue_id: The load-balanced queue ID.
@@ -693,12 +954,46 @@ struct dlb2_pending_port_unmaps_args {
 };
 
 /*
- * DLB2_DOMAIN_CMD_ENABLE_CQ_WEIGHT: Enable QE-weight based scheduling on a
- *      load-balanced port's CQ and configures the CQ's weight limit.
+ * DLB2_CMD_GET_LDB_PORT_PP_FD: Get file descriptor to mmap a load-balanced
+ *	port's producer port (PP).
+ * DLB2_CMD_GET_LDB_PORT_CQ_FD: Get file descriptor to mmap a load-balanced
+ *	port's consumer queue (CQ).
  *
- *      This must be called after creating the port but before starting the
- *      domain. The QE weight limit must be non-zero and cannot exceed the
- *      CQ's depth.
+ *	The load-balanced port must have been previously created with the ioctl
+ *	DLB2_CMD_CREATE_LDB_PORT. The fd is used to mmap the PP/CQ region.
+ *
+ * DLB2_CMD_GET_DIR_PORT_PP_FD: Get file descriptor to mmap a directed port's
+ *	producer port (PP).
+ * DLB2_CMD_GET_DIR_PORT_CQ_FD: Get file descriptor to mmap a directed port's
+ *	consumer queue (CQ).
+ *
+ *	The directed port must have been previously created with the ioctl
+ *	DLB2_CMD_CREATE_DIR_PORT. The fd is used to mmap PP/CQ region.
+ *
+ * Input parameters:
+ * - port_id: port ID.
+ * - padding0: Reserved for future use.
+ *
+ * Output parameters:
+ * - response.status: Detailed error code. In certain cases, such as if the
+ *	ioctl request arg is invalid, the driver won't set status.
+ * - response.id: fd.
+ */
+struct dlb2_get_port_fd_args {
+	/* Output parameters */
+	struct dlb2_cmd_response response;
+	/* Input parameters */
+	__u32 port_id;
+	__u32 padding0;
+};
+
+/*
+ * DLB2_DOMAIN_CMD_ENABLE_CQ_WEIGHT: Enable QE-weight based scheduling on a
+ *	load-balanced port's CQ and configures the CQ's weight limit.
+ *
+ *	This must be called after creating the port but before starting the
+ *	domain. The QE weight limit must be non-zero and cannot exceed the
+ *	CQ's depth.
  *
  * Input parameters:
  * - port_id: Load-balanced port ID.
@@ -706,7 +1001,7 @@ struct dlb2_pending_port_unmaps_args {
  *
  * Output parameters:
  * - response.status: Detailed error code. In certain cases, such as if the
- *      ioctl request arg is invalid, the driver won't set status.
+ *	ioctl request arg is invalid, the driver won't set status.
  * - response.id: number of unmaps in progress.
  */
 struct dlb2_enable_cq_weight_args {
@@ -718,11 +1013,233 @@ struct dlb2_enable_cq_weight_args {
 };
 
 /*
+ * DLB2_DOMAIN_CMD_ENABLE_CQ_EPOLL: Enable epoll support to monitor event
+ *      file descriptors created for directed and load-balanced port's CQs.
+ *	Kernel notifies user-space of events through the eventfds.
+ *
+ *	This must be called after creating the port. It can be called after
+ *	starting the domain.
+ *
+ * Input parameters:
+ * - port_id: Directed or Load-balanced port ID.
+ * - process_id: Process id of the user space application.
+ * - event_fd: Event file descriptor.
+ * - is_ldb: True for load-balanced port and false for directed port.
+ *
+ * Output parameters:
+ * - response.status
+ * - response.id: port_id
+ */
+struct dlb2_enable_cq_epoll_args {
+       /* Output parameters */
+       struct dlb2_cmd_response response;
+       /* Input parameters */
+       __u32 port_id;
+       __u32 process_id;
+       __u32 event_fd;
+       __u8 is_ldb;
+       __u8 padding0[3];
+};
+
+/*
+ * DLB2_DOMAIN_CMD_SET_CQ_INFLIGHT_CTRL: Set Per-CQ inflight control for
+ * 	{ATM,UNO,ORD} QEs.
+ *
+ * Input parameters:
+ * - port_id: Load-balanced port ID.
+ * - enable: True if inflight control is enabled. False otherwise
+ * - threshold: Per CQ inflight threshold.
+ *
+ * Output parameters:
+ * - response.status: Detailed error code. In certain cases, such as if the
+ *	ioctl request arg is invalid, the driver won't set status.
+ */
+struct dlb2_cq_inflight_ctrl_args {
+	/* Output parameters */
+	struct dlb2_cmd_response response;
+	/* Input parameters */
+	__u32 port_id;
+	__u16 enable;
+	__u16 threshold;
+};
+
+enum dlb2_domain_user_interface_commands {
+	DLB2_DOMAIN_CMD_CREATE_LDB_QUEUE,
+	DLB2_DOMAIN_CMD_CREATE_DIR_QUEUE,
+	DLB2_DOMAIN_CMD_CREATE_LDB_PORT,
+	DLB2_DOMAIN_CMD_CREATE_DIR_PORT,
+	DLB2_DOMAIN_CMD_START_DOMAIN,
+	DLB2_DOMAIN_CMD_MAP_QID,
+	DLB2_DOMAIN_CMD_UNMAP_QID,
+	DLB2_DOMAIN_CMD_ENABLE_LDB_PORT,
+	DLB2_DOMAIN_CMD_ENABLE_DIR_PORT,
+	DLB2_DOMAIN_CMD_DISABLE_LDB_PORT,
+	DLB2_DOMAIN_CMD_DISABLE_DIR_PORT,
+	DLB2_DOMAIN_CMD_BLOCK_ON_CQ_INTERRUPT,
+	DLB2_DOMAIN_CMD_ENQUEUE_DOMAIN_ALERT,
+	DLB2_DOMAIN_CMD_GET_LDB_QUEUE_DEPTH,
+	DLB2_DOMAIN_CMD_GET_DIR_QUEUE_DEPTH,
+	DLB2_DOMAIN_CMD_PENDING_PORT_UNMAPS,
+	DLB2_DOMAIN_CMD_GET_LDB_PORT_PP_FD,
+	DLB2_DOMAIN_CMD_GET_LDB_PORT_CQ_FD,
+	DLB2_DOMAIN_CMD_GET_DIR_PORT_PP_FD,
+	DLB2_DOMAIN_CMD_GET_DIR_PORT_CQ_FD,
+	DLB2_DOMAIN_CMD_ENABLE_CQ_WEIGHT,
+	DLB2_DOMAIN_CMD_ENABLE_CQ_EPOLL,
+	DLB2_DOMAIN_CMD_SET_CQ_INFLIGHT_CTRL,
+	DLB2_DOMAIN_CMD_STOP_DOMAIN,
+
+	/* NUM_DLB2_DOMAIN_CMD must be last */
+	NUM_DLB2_DOMAIN_CMD,
+};
+
+/*
  * Mapping sizes for memory mapping the consumer queue (CQ) memory space, and
  * producer port (PP) MMIO space.
  */
 #define DLB2_CQ_SIZE 65536
 #define DLB2_PP_SIZE 4096
 
+/********************/
+/* dlb2 ioctl codes */
+/********************/
 
+#define DLB2_IOC_MAGIC  'h'
+
+#define DLB2_IOC_GET_DEVICE_VERSION				\
+		_IOR(DLB2_IOC_MAGIC,				\
+		     DLB2_CMD_GET_DEVICE_VERSION,		\
+		     struct dlb2_get_device_version_args)
+#define DLB2_IOC_CREATE_SCHED_DOMAIN				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_CREATE_SCHED_DOMAIN,		\
+		      struct dlb2_create_sched_domain_args)
+#define DLB2_IOC_GET_NUM_RESOURCES				\
+		_IOR(DLB2_IOC_MAGIC,				\
+		     DLB2_CMD_GET_NUM_RESOURCES,		\
+		     struct dlb2_get_num_resources_args)
+#define DLB2_IOC_SET_SN_ALLOCATION				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_SET_SN_ALLOCATION,		\
+		      struct dlb2_set_sn_allocation_args)
+#define DLB2_IOC_GET_SN_ALLOCATION				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_GET_SN_ALLOCATION,		\
+		      struct dlb2_get_sn_allocation_args)
+#define DLB2_IOC_SET_COS_BW					\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_SET_COS_BW,			\
+		      struct dlb2_set_cos_bw_args)
+#define DLB2_IOC_GET_COS_BW					\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_GET_COS_BW,			\
+		      struct dlb2_get_cos_bw_args)
+#define DLB2_IOC_GET_SN_OCCUPANCY				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_GET_SN_OCCUPANCY,		\
+		      struct dlb2_get_sn_occupancy_args)
+#define DLB2_IOC_QUERY_CQ_POLL_MODE				\
+		_IOR(DLB2_IOC_MAGIC,				\
+		     DLB2_CMD_QUERY_CQ_POLL_MODE,		\
+		     struct dlb2_query_cq_poll_mode_args)
+#define DLB2_IOC_CREATE_LDB_QUEUE				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_CREATE_LDB_QUEUE,		\
+		      struct dlb2_create_ldb_queue_args)
+#define DLB2_IOC_CREATE_DIR_QUEUE				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_CREATE_DIR_QUEUE,		\
+		      struct dlb2_create_dir_queue_args)
+#define DLB2_IOC_CREATE_LDB_PORT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_CREATE_LDB_PORT,		\
+		      struct dlb2_create_ldb_port_args)
+#define DLB2_IOC_CREATE_DIR_PORT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_CREATE_DIR_PORT,		\
+		      struct dlb2_create_dir_port_args)
+#define DLB2_IOC_START_DOMAIN					\
+		_IOR(DLB2_IOC_MAGIC,				\
+		     DLB2_DOMAIN_CMD_START_DOMAIN,		\
+		     struct dlb2_start_domain_args)
+#define DLB2_IOC_STOP_DOMAIN					\
+		_IOR(DLB2_IOC_MAGIC,				\
+		     DLB2_DOMAIN_CMD_STOP_DOMAIN,		\
+		     struct dlb2_stop_domain_args)
+#define DLB2_IOC_MAP_QID					\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_MAP_QID,			\
+		      struct dlb2_map_qid_args)
+#define DLB2_IOC_UNMAP_QID					\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_UNMAP_QID,		\
+		      struct dlb2_unmap_qid_args)
+#define DLB2_IOC_ENABLE_LDB_PORT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_ENABLE_LDB_PORT,		\
+		      struct dlb2_enable_ldb_port_args)
+#define DLB2_IOC_ENABLE_DIR_PORT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_ENABLE_DIR_PORT,		\
+		      struct dlb2_enable_dir_port_args)
+#define DLB2_IOC_DISABLE_LDB_PORT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_DISABLE_LDB_PORT,		\
+		      struct dlb2_disable_ldb_port_args)
+#define DLB2_IOC_DISABLE_DIR_PORT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_DISABLE_DIR_PORT,		\
+		      struct dlb2_disable_dir_port_args)
+#define DLB2_IOC_BLOCK_ON_CQ_INTERRUPT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_BLOCK_ON_CQ_INTERRUPT,	\
+		      struct dlb2_block_on_cq_interrupt_args)
+#define DLB2_IOC_ENQUEUE_DOMAIN_ALERT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_ENQUEUE_DOMAIN_ALERT,	\
+		      struct dlb2_enqueue_domain_alert_args)
+#define DLB2_IOC_GET_LDB_QUEUE_DEPTH				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_GET_LDB_QUEUE_DEPTH,	\
+		      struct dlb2_get_ldb_queue_depth_args)
+#define DLB2_IOC_GET_DIR_QUEUE_DEPTH				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_GET_DIR_QUEUE_DEPTH,	\
+		      struct dlb2_get_dir_queue_depth_args)
+#define DLB2_IOC_PENDING_PORT_UNMAPS				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_PENDING_PORT_UNMAPS,	\
+		      struct dlb2_pending_port_unmaps_args)
+#define DLB2_IOC_GET_LDB_PORT_PP_FD				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_GET_LDB_PORT_PP_FD,	\
+		      struct dlb2_get_port_fd_args)
+#define DLB2_IOC_GET_LDB_PORT_CQ_FD				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_GET_LDB_PORT_CQ_FD,	\
+		      struct dlb2_get_port_fd_args)
+#define DLB2_IOC_GET_DIR_PORT_PP_FD				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_GET_DIR_PORT_PP_FD,	\
+		      struct dlb2_get_port_fd_args)
+#define DLB2_IOC_GET_DIR_PORT_CQ_FD				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_GET_DIR_PORT_CQ_FD,	\
+		      struct dlb2_get_port_fd_args)
+#define DLB2_IOC_ENABLE_CQ_EPOLL				\
+               _IOWR(DLB2_IOC_MAGIC,				\
+                     DLB2_DOMAIN_CMD_ENABLE_CQ_EPOLL,		\
+                     struct dlb2_enable_cq_epoll_args)
+#define DLB2_IOC_ENABLE_CQ_WEIGHT				\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_ENABLE_CQ_WEIGHT,		\
+		      struct dlb2_enable_cq_weight_args)
+#define DLB2_IOC_SET_CQ_INFLIGHT_CTRL\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_DOMAIN_CMD_SET_CQ_INFLIGHT_CTRL,	\
+		      struct dlb2_cq_inflight_ctrl_args)
+#define DLB2_IOC_GET_XSTATS					\
+		_IOWR(DLB2_IOC_MAGIC,				\
+		      DLB2_CMD_GET_XSTATS,			\
+		      struct dlb2_xstats_args)
 #endif /* __DLB2_USER_H */

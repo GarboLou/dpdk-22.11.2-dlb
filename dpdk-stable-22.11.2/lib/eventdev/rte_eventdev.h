@@ -7,7 +7,6 @@
 
 #ifndef _RTE_EVENTDEV_H_
 #define _RTE_EVENTDEV_H_
-
 /**
  * @file
  *
@@ -333,6 +332,7 @@ struct rte_event;
  * @see rte_event_port_link()
  */
 #define RTE_EVENT_DEV_PRIORITY_LOWEST    255
+
 /**< Lowest priority expressed across eventdev subsystem
  * @see rte_event_queue_setup(), rte_event_enqueue_burst()
  * @see rte_event_port_link()
@@ -420,7 +420,7 @@ struct rte_event_dev_info {
 	 */
 	uint8_t max_event_ports;
 	/**< Maximum number of event ports supported by this device */
-	uint8_t max_event_port_dequeue_depth;
+	uint32_t max_event_port_dequeue_depth;
 	/**< Maximum number of events can be dequeued at a time from an
 	 * event port by this device.
 	 * A device that does not support bulk dequeue will set this as 1.
@@ -563,6 +563,9 @@ struct rte_event_dev_config {
 	 * to allocate; otherwise, regular event ports and queues can be used.
 	 */
 };
+
+/* Temporary: provide compatibility with software using the older name */
+#define nb_single_link_event_ports nb_single_link_event_port_queues
 
 /**
  * Configure an event device.
@@ -830,7 +833,7 @@ rte_event_queue_attr_set(uint8_t dev_id, uint8_t queue_id, uint32_t attr_id,
  *
  *  @see rte_event_port_setup()
  */
-
+#define RTE_EVENT_PORT_CFG_RESTORE_DEQ_ORDER   (1ULL << 5)
 /** Event port configuration structure */
 struct rte_event_port_conf {
 	int32_t new_event_threshold;
@@ -963,6 +966,11 @@ rte_event_port_quiesce(uint8_t dev_id, uint8_t port_id,
  * The implicit release disable attribute of the port
  */
 #define RTE_EVENT_PORT_ATTR_IMPLICIT_RELEASE_DISABLE 3
+/**
+ * The restore dequeue order attribute of the port
+ *
+ */
+#define RTE_EVENT_PORT_ATTR_RESTORE_DEQ_ORDER 4
 
 /**
  * Get an attribute from a port.
@@ -1201,6 +1209,8 @@ struct rte_event_vector {
  */
 #define RTE_EVENT_TYPE_ETH_RX_ADAPTER   0x4
 /**< The event generated from event eth Rx adapter */
+#define RTE_EVENT_TYPE_CPPIDEV          0x5
+/**< The event generated from CPPI subsystem */
 #define RTE_EVENT_TYPE_VECTOR           0x8
 /**< Indicates that event is a vector.
  * All vector event types should be a logical OR of EVENT_TYPE_VECTOR.
@@ -1922,12 +1932,19 @@ __rte_event_enqueue_burst(uint8_t dev_id, uint8_t port_id,
 			  const struct rte_event ev[], uint16_t nb_events,
 			  const event_enqueue_burst_t fn)
 {
+#ifdef RTE_LIBRTE_EVENTDEV_DEBUG
+	struct rte_event_fp_ops *fp_ops;
+#else
 	const struct rte_event_fp_ops *fp_ops;
+#endif
+	uint16_t ret;
 	void *port;
 
 	fp_ops = &rte_event_fp_ops[dev_id];
 	port = fp_ops->data[port_id];
 #ifdef RTE_LIBRTE_EVENTDEV_DEBUG
+	struct rte_event_fp_ops *fp_ops2 = &rte_event_fp_ops[dev_id];
+
 	if (dev_id >= RTE_EVENT_MAX_DEVS ||
 	    port_id >= RTE_EVENT_MAX_PORTS_PER_DEV) {
 		rte_errno = EINVAL;
@@ -1938,6 +1955,14 @@ __rte_event_enqueue_burst(uint8_t dev_id, uint8_t port_id,
 		rte_errno = EINVAL;
 		return 0;
 	}
+
+	uint64_t orig = rte_atomic64_exchange((volatile uint64_t *)&fp_ops2->port_user_id[port_id],
+					      rte_lcore_id());
+	if (orig != RTE_UNUSED_LCORE_ID) {
+		printf("[%s()] Error: lcore %u attempted to access port %d while it is in use by lcore %lu\n",
+		       __func__, rte_lcore_id(), port_id, orig);
+		rte_panic("Port sharing detected\n");
+	}
 #endif
 	rte_eventdev_trace_enq_burst(dev_id, port_id, ev, nb_events, (void *)fn);
 	/*
@@ -1945,9 +1970,14 @@ __rte_event_enqueue_burst(uint8_t dev_id, uint8_t port_id,
 	 * requests nb_events as const one
 	 */
 	if (nb_events == 1)
-		return (fp_ops->enqueue)(port, ev);
+		ret = (fp_ops->enqueue)(port, ev);
 	else
-		return fn(port, ev, nb_events);
+		ret = fn(port, ev, nb_events);
+#ifdef RTE_LIBRTE_EVENTDEV_DEBUG
+	rte_atomic64_set(&fp_ops2->port_user_id[port_id], RTE_UNUSED_LCORE_ID);
+#endif
+
+	return ret;
 }
 
 /**
@@ -2178,12 +2208,19 @@ static inline uint16_t
 rte_event_dequeue_burst(uint8_t dev_id, uint8_t port_id, struct rte_event ev[],
 			uint16_t nb_events, uint64_t timeout_ticks)
 {
+#ifdef RTE_LIBRTE_EVENTDEV_DEBUG
+	struct rte_event_fp_ops *fp_ops;
+#else
 	const struct rte_event_fp_ops *fp_ops;
+#endif
+	uint16_t ret;
 	void *port;
 
 	fp_ops = &rte_event_fp_ops[dev_id];
 	port = fp_ops->data[port_id];
 #ifdef RTE_LIBRTE_EVENTDEV_DEBUG
+	struct rte_event_fp_ops *fp_ops2 = &rte_event_fp_ops[dev_id];
+
 	if (dev_id >= RTE_EVENT_MAX_DEVS ||
 	    port_id >= RTE_EVENT_MAX_PORTS_PER_DEV) {
 		rte_errno = EINVAL;
@@ -2194,6 +2231,14 @@ rte_event_dequeue_burst(uint8_t dev_id, uint8_t port_id, struct rte_event ev[],
 		rte_errno = EINVAL;
 		return 0;
 	}
+
+	uint64_t orig = rte_atomic64_exchange((volatile uint64_t *)&fp_ops2->port_user_id[port_id],
+					      rte_lcore_id());
+	if (orig != RTE_UNUSED_LCORE_ID) {
+		printf("[%s()] Error: lcore %u attempted to access port %d while it is in use by lcore %lu\n",
+		       __func__, rte_lcore_id(), port_id, orig);
+		rte_panic("Port sharing detected\n");
+	}
 #endif
 	rte_eventdev_trace_deq_burst(dev_id, port_id, ev, nb_events);
 	/*
@@ -2201,10 +2246,16 @@ rte_event_dequeue_burst(uint8_t dev_id, uint8_t port_id, struct rte_event ev[],
 	 * requests nb_events as const one
 	 */
 	if (nb_events == 1)
-		return (fp_ops->dequeue)(port, ev, timeout_ticks);
+		ret = (fp_ops->dequeue)(port, ev, timeout_ticks);
 	else
-		return (fp_ops->dequeue_burst)(port, ev, nb_events,
+		ret = (fp_ops->dequeue_burst)(port, ev, nb_events,
 					       timeout_ticks);
+
+#ifdef RTE_LIBRTE_EVENTDEV_DEBUG
+	rte_atomic64_set(&fp_ops2->port_user_id[port_id], RTE_UNUSED_LCORE_ID);
+#endif
+
+	return ret;
 }
 
 #define RTE_EVENT_DEV_MAINT_OP_FLUSH          (1 << 0)

@@ -35,6 +35,7 @@
 #define EVT_MAX_STAGES           64
 #define EVT_MAX_PORTS            256
 #define EVT_MAX_QUEUES           256
+#define EVT_MAX_PRODUCERS        8
 
 enum evt_prod_type {
 	EVT_PROD_TYPE_NONE,
@@ -50,6 +51,9 @@ struct evt_options {
 	char test_name[EVT_TEST_NAME_MAX_LEN];
 	bool plcores[RTE_MAX_LCORE];
 	bool wlcores[RTE_MAX_LCORE];
+	uint8_t nb_dir_queues;
+	uint8_t dir_queue_ids[RTE_EVENT_MAX_QUEUES_PER_DEV];
+	uint8_t lb_queue_ids[RTE_EVENT_MAX_QUEUES_PER_DEV];
 	int pool_sz;
 	int socket_id;
 	int nb_stages;
@@ -191,7 +195,7 @@ evt_configure_eventdev(struct evt_options *opt, uint8_t nb_queues,
 			.dequeue_timeout_ns = opt->deq_tmo_nsec,
 			.nb_event_queues = nb_queues,
 			.nb_event_ports = nb_ports,
-			.nb_single_link_event_port_queues = 0,
+			.nb_single_link_event_port_queues = opt->nb_dir_queues,
 			.nb_events_limit  = info.max_num_events,
 			.nb_event_queue_flows = opt->nb_flows,
 			.nb_event_port_dequeue_depth =
@@ -203,4 +207,49 @@ evt_configure_eventdev(struct evt_options *opt, uint8_t nb_queues,
 	return rte_event_dev_configure(opt->dev_id, &config);
 }
 
+/* Function evt_configure_eventdev() with additional parameter
+ * nb_single_link passed. Used in pipeline_queue test.
+ */
+static inline int
+evt_configure_eventdev_with_adapter(struct evt_options *opt, uint8_t nb_queues,
+		uint8_t nb_ports, uint16_t nb_single_link)
+{
+	struct rte_event_dev_info info;
+	int ret;
+
+	memset(&info, 0, sizeof(struct rte_event_dev_info));
+	ret = rte_event_dev_info_get(opt->dev_id, &info);
+	if (ret) {
+		evt_err("failed to get eventdev info %d", opt->dev_id);
+		return ret;
+	}
+
+	if (opt->deq_tmo_nsec) {
+		if (opt->deq_tmo_nsec < info.min_dequeue_timeout_ns) {
+			opt->deq_tmo_nsec = info.min_dequeue_timeout_ns;
+			evt_info("dequeue_timeout_ns too low, using %d",
+					opt->deq_tmo_nsec);
+		}
+		if (opt->deq_tmo_nsec > info.max_dequeue_timeout_ns) {
+			opt->deq_tmo_nsec = info.max_dequeue_timeout_ns;
+			evt_info("dequeue_timeout_ns too high, using %d",
+					opt->deq_tmo_nsec);
+		}
+	}
+
+	struct rte_event_dev_config config = {
+			.dequeue_timeout_ns = opt->deq_tmo_nsec,
+			.nb_event_queues = nb_queues,
+			.nb_event_ports = nb_ports,
+			.nb_single_link_event_port_queues = nb_single_link,
+			.nb_events_limit  = info.max_num_events,
+			.nb_event_queue_flows = opt->nb_flows,
+			.nb_event_port_dequeue_depth =
+				info.max_event_port_dequeue_depth,
+			.nb_event_port_enqueue_depth =
+				info.max_event_port_enqueue_depth,
+	};
+	config.nb_event_ports += config.nb_single_link_event_port_queues;
+	return rte_event_dev_configure(opt->dev_id, &config);
+}
 #endif /*  _EVT_COMMON_*/

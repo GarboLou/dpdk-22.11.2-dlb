@@ -5,5 +5,6 @@ DPDK_23 {
 EXPERIMENTAL {
 	global:
 
+	rte_pmd_dlb2_set_port_param;
 	rte_pmd_dlb2_set_token_pop_mode;
 };

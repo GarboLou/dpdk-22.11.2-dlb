@@ -566,7 +566,16 @@ l2fwd_event_resource_setup(struct l2fwd_resources *rsrc)
 	event_queue_cfg = evt_rsrc->ops.event_device_setup(rsrc);
 
 	/* Event queue configuration */
-	evt_rsrc->ops.event_queue_setup(rsrc, event_queue_cfg);
+	ret = evt_rsrc->ops.event_queue_setup(rsrc, event_queue_cfg);
+	if (ret < 0) {
+		/* TX adapter config error; try with strict single-link configuration */
+		rsrc->strict_single_link = true;
+		event_queue_cfg = evt_rsrc->ops.event_device_setup(rsrc);
+		ret = evt_rsrc->ops.event_queue_setup(rsrc, event_queue_cfg);
+		/* If still error, panic */
+		if (ret < 0)
+			rte_panic("Error in configuring event queue for Tx adapter");
+	}
 
 	/* Event port configuration */
 	evt_rsrc->ops.event_port_setup(rsrc);

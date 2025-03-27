@@ -2,12 +2,10 @@
  * Copyright(c) 2016-2020 Intel Corporation
  */
 
-#ifndef __DLB2_HW_TYPES_NEW_H
-#define __DLB2_HW_TYPES_NEW_H
+#ifndef __DLB2_HW_TYPES_H
+#define __DLB2_HW_TYPES_H
 
-#include "../../dlb2_priv.h"
 #include "dlb2_user.h"
-
 #include "dlb2_osdep_list.h"
 #include "dlb2_osdep_types.h"
 #include "dlb2_regs.h"
@@ -18,25 +16,67 @@
 #define DLB2_BIT_SET(x, mask)	((x) |= (mask))
 #define DLB2_BITS_GET(x, mask)	(((x) & (mask)) >> (mask##_LOC))
 
+#define DLB2_SYND2(y)        DLB2_BITS_GET(synd2, DLB2_SYS_ALARM_PF_SYND2_##y)
+#define DLB2_SYND1(y)        DLB2_BITS_GET(synd1, DLB2_SYS_ALARM_PF_SYND1_##y)
+#define DLB2_SYND0(y)        DLB2_BITS_GET(synd0, DLB2_SYS_ALARM_PF_SYND0_##y)
+#define DLB2_SYND(y)         DLB2_BITS_GET(synd, DLB2_SYS_ALARM_HW_SYND_##y)
+
 #define DLB2_MAX_NUM_VDEVS			16
-#define DLB2_MAX_NUM_SEQUENCE_NUMBER_GROUPS	2
-#define DLB2_NUM_ARB_WEIGHTS			8
+#define DLB2_MAX_NUM_DOMAINS			32
+#define DLB2_MAX_NUM_LDB_QUEUES			32 /* LDB == load-balanced */
+#define DLB2_MAX_NUM_DIR_QUEUES_V2		64 /* DIR == directed */
+#define DLB2_MAX_NUM_DIR_QUEUES_V2_5		96
+/* When needed for array sizing, the DLB 2.5 macro is used */
+#define DLB2_MAX_NUM_DIR_QUEUES(ver)		(ver == DLB2_HW_V2 ? \
+						 DLB2_MAX_NUM_DIR_QUEUES_V2 : \
+						 DLB2_MAX_NUM_DIR_QUEUES_V2_5)
+#define DLB2_MAX_NUM_LDB_PORTS			64
+#define DLB2_MAX_NUM_DIR_PORTS_V2		DLB2_MAX_NUM_DIR_QUEUES_V2
+#define DLB2_MAX_NUM_DIR_PORTS_V2_5		DLB2_MAX_NUM_DIR_QUEUES_V2_5
+#define DLB2_MAX_NUM_DIR_PORTS(ver)		(ver == DLB2_HW_V2 ? \
+						 DLB2_MAX_NUM_DIR_PORTS_V2 : \
+						 DLB2_MAX_NUM_DIR_PORTS_V2_5)
+#define DLB2_MAX_NUM_LDB_CREDITS		(8 * 1024)
+#define DLB2_MAX_NUM_DIR_CREDITS(ver)		(ver == DLB2_HW_V2 ? 4096 : 0)
+#define DLB2_MAX_NUM_HIST_LIST_ENTRIES		2048
 #define DLB2_MAX_NUM_AQED_ENTRIES		2048
-#define DLB2_MAX_WEIGHT				255
-#define DLB2_NUM_COS_DOMAINS			4
+#define DLB2_MAX_NUM_QIDS_PER_LDB_CQ		8
 #define DLB2_MAX_NUM_SEQUENCE_NUMBER_GROUPS	2
 #define DLB2_MAX_NUM_SEQUENCE_NUMBER_MODES	5
+#define DLB2_QID_PRIORITIES			8
+#define DLB2_NUM_ARB_WEIGHTS			8
+#define DLB2_MAX_WEIGHT				255
+#define DLB2_NUM_COS_DOMAINS			4
 #define DLB2_MAX_CQ_COMP_CHECK_LOOPS		409600
-#define DLB2_MAX_QID_EMPTY_CHECK_LOOPS		(4 * DLB2_MAX_NUM_LDB_CREDITS)
-
+#define DLB2_MAX_QID_EMPTY_CHECK_LOOPS(ver)	(4 * DLB2_MAX_NUM_LDB_CREDITS)
+#ifdef FPGA
+#define DLB2_HZ					2000000
+#else
+#define DLB2_HZ					800000000
+#endif
 #define DLB2_FUNC_BAR				0
 #define DLB2_CSR_BAR				2
 
 #define PCI_DEVICE_ID_INTEL_DLB2_PF 0x2710
 #define PCI_DEVICE_ID_INTEL_DLB2_VF 0x2711
-
 #define PCI_DEVICE_ID_INTEL_DLB2_5_PF 0x2714
 #define PCI_DEVICE_ID_INTEL_DLB2_5_VF 0x2715
+
+/* Interrupt related macros */
+#define DLB2_PF_NUM_NON_CQ_INTERRUPT_VECTORS 1
+#define DLB2_PF_NUM_CQ_INTERRUPT_VECTORS     64
+#define DLB2_PF_TOTAL_NUM_INTERRUPT_VECTORS \
+	(DLB2_PF_NUM_NON_CQ_INTERRUPT_VECTORS + \
+	 DLB2_PF_NUM_CQ_INTERRUPT_VECTORS)
+#define DLB2_PF_NUM_COMPRESSED_MODE_VECTORS \
+	(DLB2_PF_NUM_NON_CQ_INTERRUPT_VECTORS + 1)
+#define DLB2_PF_NUM_PACKED_MODE_VECTORS \
+	DLB2_PF_TOTAL_NUM_INTERRUPT_VECTORS
+#define DLB2_PF_COMPRESSED_MODE_CQ_VECTOR_ID \
+	DLB2_PF_NUM_NON_CQ_INTERRUPT_VECTORS
+
+/* DLB non-CQ interrupts (alarm, mailbox, WDT) */
+#define DLB2_INT_NON_CQ 0
 
 #define DLB2_ALARM_HW_SOURCE_SYS 0
 #define DLB2_ALARM_HW_SOURCE_DLB 1
@@ -48,6 +88,20 @@
 #define DLB2_ALARM_SYS_AID_ILLEGAL_HCW		5
 #define DLB2_ALARM_HW_CHP_AID_ILLEGAL_ENQ	1
 #define DLB2_ALARM_HW_CHP_AID_EXCESS_TOKEN_POPS 2
+
+#define DLB2_VF_NUM_NON_CQ_INTERRUPT_VECTORS 1
+#define DLB2_VF_NUM_CQ_INTERRUPT_VECTORS     31
+#define DLB2_VF_BASE_CQ_VECTOR_ID	     0
+#define DLB2_VF_LAST_CQ_VECTOR_ID	     30
+#define DLB2_VF_MBOX_VECTOR_ID		     31
+#define DLB2_VF_TOTAL_NUM_INTERRUPT_VECTORS \
+	(DLB2_VF_NUM_NON_CQ_INTERRUPT_VECTORS + \
+	 DLB2_VF_NUM_CQ_INTERRUPT_VECTORS)
+
+#define DLB2_VDEV_MAX_NUM_INTERRUPT_VECTORS_V2 \
+	(DLB2_MAX_NUM_LDB_PORTS + DLB2_MAX_NUM_DIR_PORTS_V2 + 1)
+#define DLB2_VDEV_MAX_NUM_INTERRUPT_VECTORS_V2_5 \
+	(DLB2_MAX_NUM_LDB_PORTS + DLB2_MAX_NUM_DIR_PORTS_V2_5 + 1)
 
 /*
  * Hardware-defined base addresses. Those prefixed 'DLB2_DRV' are only used by
@@ -148,7 +202,7 @@ struct dlb2_dir_pq_pair {
 };
 
 enum dlb2_qid_map_state {
-	/* The slot does not contain a valid queue mapping */
+	/* The slot doesn't contain a valid queue mapping */
 	DLB2_QUEUE_UNMAPPED,
 	/* The slot contains a valid queue mapping */
 	DLB2_QUEUE_MAPPED,
@@ -332,6 +386,18 @@ struct dlb2_sw_mbox {
 	void *pf_to_vdev_inject_arg;
 };
 
+struct dlb2_hw_sched_idle_counts {
+	u64 ldb_perf_sched_cnt;
+	u64 ldb_perf_nowork_idle_cnt;
+	u64 ldb_perf_nospace_idle_cnt;
+	u64 ldb_perf_pfriction_idle_cnt;
+	u64 ldb_perf_iflimit_idle_cnt;
+	u64 ldb_perf_fidlimit_idle_cnt;
+	u64 perf_proc_on_cnt;
+	u64 perf_clk_on_cnt;
+	u64 hcw_err_cnt;
+};
+
 struct dlb2_hw {
 	uint8_t ver;
 
@@ -359,4 +425,4 @@ struct dlb2_hw {
 	unsigned int pasid[DLB2_MAX_NUM_VDEVS];
 };
 
-#endif /* __DLB2_HW_TYPES_NEW_H */
+#endif /* __DLB2_HW_TYPES_H */

@@ -20,6 +20,7 @@
 #include <rte_cycles.h>
 #include <rte_eventdev.h>
 #include <rte_pause.h>
+#include <dev_driver.h>
 
 #include "dlb2_priv.h"
 #include "rte_pmd_dlb2.h"
@@ -223,7 +224,7 @@ test_stop_flush(struct test *t) /* test to check we can properly flush events */
 				    0,
 				    RTE_EVENT_PORT_ATTR_DEQ_DEPTH,
 				    &dequeue_depth)) {
-		printf("%d: Error retrieving dequeue depth\n", __LINE__);
+		printf("%d: Error retrieveing dequeue depth\n", __LINE__);
 		goto err;
 	}
 
@@ -1354,7 +1355,7 @@ test_delayed_pop(void)
 	}
 
 	/* Release one more event. This will trigger the token pop, and
-	 * dequeue_depth more events will be scheduled to the device.
+	 * dequeue_depth - 1 more events will be scheduled to the device.
 	 */
 	ev.op = RTE_EVENT_OP_RELEASE;
 
@@ -1480,7 +1481,6 @@ test_dlb2_eventdev(void)
 	int i, ret = 0;
 	int found = 0, skipped = 0, passed = 0, failed = 0;
 	struct rte_event_dev_info info;
-
 	for (i = 0; found + skipped < num_evdevs && i < RTE_EVENT_MAX_DEVS;
 	     i++) {
 		ret = rte_event_dev_info_get(i, &info);
@@ -1494,7 +1494,13 @@ test_dlb2_eventdev(void)
 			continue;
 		}
 
-		evdev = rte_event_dev_get_dev_id(info.driver_name);
+		if (info.dev)
+			/* PF PMD Mode */
+			evdev = rte_event_dev_get_dev_id(info.dev->driver->name);
+		else  /* Bifurcated PMD Mode */
+			evdev = rte_event_dev_get_dev_id(info.driver_name);
+
+
 		if (evdev < 0) {
 			printf("Could not get dev_id for eventdev with name %s, i=%d\n",
 			       info.driver_name, i);

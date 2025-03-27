@@ -16,9 +16,7 @@
 #include <rte_log.h>
 #include <rte_spinlock.h>
 #include "../dlb2_main.h"
-
 #include "dlb2_resource.h"
-
 #include "../../dlb2_log.h"
 #include "../../dlb2_user.h"
 
@@ -91,7 +89,7 @@ static inline void *os_map_producer_port(struct dlb2_hw *hw,
 	uint64_t pp_dma_base;
 
 	pp_dma_base = (uintptr_t)hw->func_kva + DLB2_PP_BASE(is_ldb);
-	addr = (pp_dma_base + (rte_mem_page_size() * port_id));
+	addr = (pp_dma_base + (PAGE_SIZE * port_id));
 
 	return (void *)(uintptr_t)addr;
 }
@@ -128,6 +126,48 @@ static inline void os_fence_hcw(struct dlb2_hw *hw, u64 *pp_addr)
 	rte_mb();
 
 	*(volatile u64 *)pp_addr;
+}
+
+/**
+ * os_enqueue_four_hcws() - enqueue four HCWs to DLB
+ * @hw: dlb2_hw handle for a particular device.
+ * @hcw: pointer to the 64B-aligned contiguous HCW memory
+ * @addr: producer port address
+ */
+static inline void os_enqueue_four_hcws(struct dlb2_hw *hw,
+					struct dlb2_hcw *hcw,
+					void *addr)
+{
+	struct dlb2_dev *dlb2_dev;
+	dlb2_dev = container_of(hw, struct dlb2_dev, hw);
+
+	dlb2_dev->enqueue_four(addr, hcw);
+}
+
+/**
+ * os_notify_user_space() - notify user space
+ * @hw: dlb2_hw handle for a particular device.
+ * @domain_id: ID of domain to notify.
+ * @alert_id: alert ID.
+ * @aux_alert_data: additional alert data.
+ *
+ * This function notifies user space of an alert (such as a hardware alarm).
+ *
+ * Return:
+ * Returns 0 upon success, <0 otherwise.
+ */
+static inline int os_notify_user_space(struct dlb2_hw *hw,
+				       u32 domain_id,
+				       u64 alert_id,
+				       u64 aux_alert_data)
+{
+	RTE_SET_USED(hw);
+	RTE_SET_USED(domain_id);
+	RTE_SET_USED(alert_id);
+	RTE_SET_USED(aux_alert_data);
+
+	/* Not called for PF PMD */
+	return -1;
 }
 
 /**
@@ -199,17 +239,19 @@ static inline void os_schedule_work(struct dlb2_hw *hw)
 
 	dlb2_dev = container_of(hw, struct dlb2_dev, hw);
 
+	dlb2_dev->worker_launched = true;
+
 	ret = rte_ctrl_thread_create(&complete_queue_map_unmap_thread,
 				     "dlb_queue_unmap_waiter",
 				     NULL,
 				     dlb2_complete_queue_map_unmap,
 				     dlb2_dev);
-	if (ret)
+	if (ret) {
 		DLB2_ERR(dlb2_dev,
 			 "Could not create queue complete map/unmap thread, err=%d\n",
 			 ret);
-	else
-		dlb2_dev->worker_launched = true;
+		dlb2_dev->worker_launched = false;
+	}
 }
 
 /**

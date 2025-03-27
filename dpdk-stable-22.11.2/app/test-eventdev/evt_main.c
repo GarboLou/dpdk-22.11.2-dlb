@@ -16,6 +16,7 @@
 
 struct evt_options opt;
 struct evt_test *test;
+static rte_atomic32_t evt_dest = RTE_ATOMIC32_INIT(0);
 
 static void
 signal_handler(int signum)
@@ -29,6 +30,9 @@ signal_handler(int signum)
 			*(int *)test->test_priv = true;
 			rte_wmb();
 		}
+	} else if (signum == SIGALRM && test->ops.eventdev_destroy &&
+		   rte_atomic32_test_and_set(&evt_dest)) {
+		test->ops.eventdev_destroy(test, &opt);
 	}
 }
 
@@ -48,6 +52,7 @@ main(int argc, char **argv)
 
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
+	signal(SIGALRM, signal_handler);
 
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -160,6 +165,13 @@ main(int argc, char **argv)
 	if (test->ops.ethdev_rx_stop)
 		test->ops.ethdev_rx_stop(test, &opt);
 
+	/*
+	 * Worker threads may get stuck waiting for events in interrupt mode.
+	 * Setting alarm to stop eventdev after 1 sec to wake up workers and
+	 * terminate.
+	 */
+	alarm(1);
+
 	rte_eal_mp_wait_lcore();
 
 	if (test->ops.test_result)
@@ -168,7 +180,8 @@ main(int argc, char **argv)
 	if (test->ops.ethdev_destroy)
 		test->ops.ethdev_destroy(test, &opt);
 
-	if (test->ops.eventdev_destroy)
+	/* Destroy eventdev if not already done by alarm handler*/
+	if (test->ops.eventdev_destroy && rte_atomic32_test_and_set(&evt_dest))
 		test->ops.eventdev_destroy(test, &opt);
 
 	if (test->ops.cryptodev_destroy)

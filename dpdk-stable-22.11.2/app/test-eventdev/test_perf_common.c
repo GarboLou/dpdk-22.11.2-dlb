@@ -179,11 +179,10 @@ perf_producer_burst(void *arg)
 	uint32_t flow_counter = 0;
 	uint16_t enq = 0;
 	uint64_t count = 0;
-	struct perf_elt *m[MAX_PROD_ENQ_BURST_SIZE + 1];
+	struct perf_elt *m[MAX_PROD_ENQ_BURST_SIZE + 1] = {NULL};
 	struct rte_event ev[MAX_PROD_ENQ_BURST_SIZE + 1];
 	uint32_t burst_size = opt->prod_enq_burst_sz;
 
-	memset(m, 0, sizeof(*m) * (MAX_PROD_ENQ_BURST_SIZE + 1));
 	rte_event_dev_info_get(dev_id, &dev_info);
 	if (dev_info.max_event_port_enqueue_depth < burst_size)
 		burst_size = dev_info.max_event_port_enqueue_depth;
@@ -210,18 +209,18 @@ perf_producer_burst(void *arg)
 			ev[i].event_ptr = m[i];
 			m[i]->timestamp = timestamp;
 		}
-		enq = rte_event_enqueue_burst(dev_id, port, ev, burst_size);
-		while (enq < burst_size) {
-			enq += rte_event_enqueue_burst(dev_id, port,
-							ev + enq,
+                enq = rte_event_enqueue_burst(dev_id, port, ev, burst_size);
+                while (enq < burst_size) {
+                        enq += rte_event_enqueue_burst(dev_id, port,
+                                                        ev + enq,
 							burst_size - enq);
-			if (t->done)
-				break;
+                        if (t->done)
+                                break;
 			rte_pause();
 			timestamp = rte_get_timer_cycles();
 			for (i = enq; i < burst_size; i++)
 				m[i]->timestamp = timestamp;
-		}
+                }
 		count += burst_size;
 	}
 	return 0;
@@ -560,29 +559,33 @@ perf_producer_wrapper(void *arg)
 	struct prod_data *p  = arg;
 	struct test_perf *t = p->t;
 	bool burst = evt_has_burst_mode(p->dev_id);
+	int ret = 0;
 
 	/* In case of synthetic producer, launch perf_producer or
 	 * perf_producer_burst depending on producer enqueue burst size
 	 */
 	if (t->opt->prod_type == EVT_PROD_TYPE_SYNT &&
 			t->opt->prod_enq_burst_sz == 1)
-		return perf_producer(arg);
+		ret =  perf_producer(arg);
 	else if (t->opt->prod_type == EVT_PROD_TYPE_SYNT &&
 			t->opt->prod_enq_burst_sz > 1) {
 		if (!burst)
 			evt_err("This event device does not support burst mode");
 		else
-			return perf_producer_burst(arg);
+			ret = perf_producer_burst(arg);
 	}
 	else if (t->opt->prod_type == EVT_PROD_TYPE_EVENT_TIMER_ADPTR &&
 			!t->opt->timdev_use_burst)
-		return perf_event_timer_producer(arg);
+		ret =  perf_event_timer_producer(arg);
 	else if (t->opt->prod_type == EVT_PROD_TYPE_EVENT_TIMER_ADPTR &&
 			t->opt->timdev_use_burst)
-		return perf_event_timer_producer_burst(arg);
+		ret =  perf_event_timer_producer_burst(arg);
 	else if (t->opt->prod_type == EVT_PROD_TYPE_EVENT_CRYPTO_ADPTR)
-		return perf_event_crypto_producer(arg);
-	return 0;
+		ret =  perf_event_crypto_producer(arg);
+
+	/* Unlink port to release any acquired HW resources*/
+	rte_event_port_unlink(p->dev_id, p->port_id, &p->queue_id, 1);
+	return ret;
 }
 
 static inline uint64_t
@@ -946,8 +949,18 @@ perf_event_dev_port_setup(struct evt_test *test, struct evt_options *opt,
 			return ret;
 		}
 
-		ret = rte_event_port_link(opt->dev_id, port, NULL, NULL, 0);
-		if (ret != nb_queues) {
+		if (opt->nb_dir_queues) {
+			uint8_t queues[EVT_MAX_PRODUCERS] = {0};
+			uint8_t prio[EVT_MAX_PRODUCERS] = {0};
+			uint8_t i;
+
+			for (i = 0; i < nb_queues - opt->nb_dir_queues; ++i)
+				queues[i] = opt->lb_queue_ids[i];
+			ret = rte_event_port_link(opt->dev_id, port, queues, prio, i);
+		} else {
+			ret = rte_event_port_link(opt->dev_id, port, NULL, NULL, 0);
+		}
+		if (ret != nb_queues - opt->nb_dir_queues) {
 			evt_err("failed to link all queues to port %d", port);
 			return -EINVAL;
 		}
@@ -1084,11 +1097,31 @@ perf_event_dev_port_setup(struct evt_test *test, struct evt_options *opt,
 			conf.event_port_cfg |=
 				RTE_EVENT_PORT_CFG_HINT_PRODUCER |
 				RTE_EVENT_PORT_CFG_HINT_CONSUMER;
+			if (opt->nb_dir_queues)
+				conf.event_port_cfg |= RTE_EVENT_PORT_CFG_SINGLE_LINK;
 
 			ret = rte_event_port_setup(opt->dev_id, port, &conf);
 			if (ret) {
 				evt_err("failed to setup port %d", port);
 				return ret;
+			}
+			if (opt->nb_dir_queues) {
+				uint8_t prio = 0;
+				
+				/*
+				 * For KW errors
+				 */
+				port = port % RTE_EVENT_MAX_PORTS_PER_DEV;
+				prod = prod % RTE_EVENT_MAX_PORTS_PER_DEV;
+
+				if (rte_event_port_link(opt->dev_id, port,
+							&opt->dir_queue_ids[prod],
+							&prio, 1) != 1) {
+					evt_err("failed to link dir queue %d "
+						"to port %d",
+						opt->dir_queue_ids[prod], port);
+					return -EINVAL;
+				}
 			}
 			prod++;
 		}
@@ -1218,7 +1251,7 @@ perf_worker_cleanup(struct rte_mempool *const pool, uint8_t dev_id,
 
 		for (i = 0; i < nb_deq; i++)
 			events[i].op = RTE_EVENT_OP_RELEASE;
-		rte_event_enqueue_burst(dev_id, port_id, events, nb_deq);
+		rte_event_enqueue_burst(dev_id, port_id, events + nb_enq, nb_deq - nb_enq);
 	}
 	rte_event_port_quiesce(dev_id, port_id, perf_event_port_flush, pool);
 }

@@ -36,6 +36,9 @@ l2fwd_event_device_setup_generic(struct l2fwd_resources *rsrc)
 	uint16_t port_id;
 	int ret;
 
+	if (rsrc->strict_single_link)
+		event_d_conf.nb_single_link_event_port_queues = 1;
+
 	RTE_ETH_FOREACH_DEV(port_id) {
 		if ((rsrc->enabled_port_mask & (1 << port_id)) == 0)
 			continue;
@@ -83,6 +86,11 @@ l2fwd_event_device_setup_generic(struct l2fwd_resources *rsrc)
 	evt_rsrc->evp.nb_ports = num_workers;
 	evt_rsrc->evq.nb_queues = event_d_conf.nb_event_queues;
 
+	if (rsrc->strict_single_link) {
+		event_d_conf.nb_event_ports++;
+		evt_rsrc->evp.nb_ports++;
+	}
+
 	evt_rsrc->has_burst = !!(dev_info.event_dev_cap &
 				    RTE_EVENT_DEV_CAP_BURST_MODE);
 
@@ -108,6 +116,9 @@ l2fwd_event_port_setup_generic(struct l2fwd_resources *rsrc)
 	struct rte_event_port_conf def_p_conf;
 	uint8_t event_p_id;
 	int32_t ret;
+	uint8_t effective_ports = rsrc->strict_single_link ?
+					evt_rsrc->evp.nb_ports - 1 :
+					evt_rsrc->evp.nb_ports;
 
 	evt_rsrc->evp.event_p_id = (uint8_t *)malloc(sizeof(uint8_t) *
 					evt_rsrc->evp.nb_ports);
@@ -136,8 +147,7 @@ l2fwd_event_port_setup_generic(struct l2fwd_resources *rsrc)
 
 	evt_rsrc->deq_depth = def_p_conf.dequeue_depth;
 
-	for (event_p_id = 0; event_p_id < evt_rsrc->evp.nb_ports;
-								event_p_id++) {
+	for (event_p_id = 0; event_p_id < effective_ports; event_p_id++) {
 		ret = rte_event_port_setup(event_d_id, event_p_id,
 					   &event_p_conf);
 		if (ret < 0)
@@ -160,7 +170,7 @@ l2fwd_event_port_setup_generic(struct l2fwd_resources *rsrc)
 	evt_rsrc->def_p_conf = event_p_conf;
 }
 
-static void
+static int
 l2fwd_event_queue_setup_generic(struct l2fwd_resources *rsrc,
 			  uint32_t event_queue_cfg)
 {
@@ -169,7 +179,7 @@ l2fwd_event_queue_setup_generic(struct l2fwd_resources *rsrc,
 	/* Event queue initialization. 8< */
 	struct rte_event_queue_conf event_q_conf = {
 		.nb_atomic_flows = 1024,
-		.nb_atomic_order_sequences = 1024,
+		.nb_atomic_order_sequences = 64,
 		.event_queue_cfg = event_queue_cfg,
 		.priority = RTE_EVENT_DEV_PRIORITY_NORMAL
 	};
@@ -203,9 +213,12 @@ l2fwd_event_queue_setup_generic(struct l2fwd_resources *rsrc,
 	event_q_conf.event_queue_cfg |= RTE_EVENT_QUEUE_CFG_SINGLE_LINK;
 	event_q_conf.priority = RTE_EVENT_DEV_PRIORITY_HIGHEST,
 	ret = rte_event_queue_setup(event_d_id, event_q_id, &event_q_conf);
+
 	if (ret < 0)
-		rte_panic("Error in configuring event queue for Tx adapter\n");
+		return ret;
+
 	evt_rsrc->evq.event_q_id[event_q_id] = event_q_id;
+	return 0;
 }
 
 static void
@@ -298,9 +311,12 @@ l2fwd_rx_tx_adapter_setup_generic(struct l2fwd_resources *rsrc)
 		free(evt_rsrc->evq.event_q_id);
 		rte_panic("Failed to allocate memery for Rx adapter\n");
 	}
+	if (rsrc->strict_single_link)
+		evt_rsrc->def_p_conf.event_port_cfg |= RTE_EVENT_PORT_CFG_SINGLE_LINK;
 
 	ret = rte_event_eth_tx_adapter_create(tx_adptr_id, event_d_id,
 					      &evt_rsrc->def_p_conf);
+
 	if (ret)
 		rte_panic("Failed to create tx adapter\n");
 

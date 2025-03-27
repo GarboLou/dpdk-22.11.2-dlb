@@ -8,6 +8,11 @@
 #include "l3fwd.h"
 #include "l3fwd_common.h"
 
+#ifdef L3FWDACL_DEBUG
+static inline void dump_acl4_rule(struct rte_mbuf *m, uint32_t sig);
+static inline void dump_acl6_rule(struct rte_mbuf *m, uint32_t sig);
+#endif
+
 static inline void
 l3fwd_acl_prepare_one_packet(struct rte_mbuf **pkts_in, struct acl_search_t *acl,
 	int index)
@@ -93,11 +98,11 @@ l3fwd_acl_send_packets(struct lcore_conf *qconf, struct rte_mbuf *pkts[], uint32
 		} else {
 			dst_port[i] = BAD_PORT;
 #ifdef L3FWDACL_DEBUG
-			if ((res & ACL_DENY_SIGNATURE) != 0) {
+			if (((uint64_t)res & (uint64_t)ACL_DENY_SIGNATURE) != 0) {
 				if (RTE_ETH_IS_IPV4_HDR(pkts[i]->packet_type))
 					dump_acl4_rule(pkts[i], res[i]);
-				else if (RTE_ETH_IS_IPV6_HDR(pkt[i]->packet_type))
-					dump_acl6_rule(pkt[i], res[i]);
+				else if (RTE_ETH_IS_IPV6_HDR(pkts[i]->packet_type))
+					dump_acl6_rule(pkts[i], res[i]);
 			}
 #endif
 		}
