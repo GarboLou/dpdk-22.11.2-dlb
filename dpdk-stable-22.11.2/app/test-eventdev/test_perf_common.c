@@ -2022,13 +2022,14 @@ perf_ethdev_rx_stop(struct evt_test *test, struct evt_options *opt)
 {
 	uint16_t i;
 	RTE_SET_USED(test);
+	printf("Stopping RX adapter\n");
 
 	if (opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR) {
 		RTE_ETH_FOREACH_DEV(i) {
             /* TODO */
             for (uint16_t q = 0; q < opt->nb_rx_adapters; q++) {
                 rte_event_eth_rx_adapter_stop(q);
-                rte_event_eth_rx_adapter_queue_del(q, i, q);
+                rte_event_eth_rx_adapter_queue_del(q, i, -1);
 			    rte_eth_dev_rx_queue_stop(i, q);
             }
             // rte_event_eth_rx_adapter_stop(i);
@@ -2043,6 +2044,7 @@ perf_ethdev_destroy(struct evt_test *test, struct evt_options *opt)
 {
 	uint16_t i;
 	RTE_SET_USED(test);
+	printf("Destroying ethdev\n");
 
 	if (opt->prod_type == EVT_PROD_TYPE_ETH_RX_ADPTR) {
 		RTE_ETH_FOREACH_DEV(i) {

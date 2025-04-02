@@ -237,6 +237,30 @@ perf_process_last_stage_latency(struct rte_mempool *const pool, uint8_t prod_cry
 	return count;
 }
 
+static inline void delay_nanoseconds(uint64_t nanoseconds, struct test_perf* t) {
+    uint64_t start_time, end_time;
+    uint64_t elapsed_nanoseconds;
+    uint64_t cycles = nanoseconds;
+    // printf("hz: %lu, nanoseconds: %lu\n", tsc_hz, nanoseconds);
+
+    start_time = rte_get_timer_cycles();
+    do {
+        end_time = rte_get_timer_cycles();
+        elapsed_nanoseconds = end_time - start_time;
+    } while (elapsed_nanoseconds < cycles && !t->done);
+}
+
+static inline void delay_cycles(uint64_t cycles, struct test_perf* t) {
+    uint64_t start_time, end_time;
+    uint64_t elapsed_nanoseconds;
+
+    start_time = rte_get_timer_cycles();
+    do {
+        end_time = rte_get_timer_cycles();
+        elapsed_nanoseconds = end_time - start_time;
+    } while (elapsed_nanoseconds < cycles && !t->done);
+}
+
 
 static inline int
 perf_nb_event_ports(struct evt_options *opt)

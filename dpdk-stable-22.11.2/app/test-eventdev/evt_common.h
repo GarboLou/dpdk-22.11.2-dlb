@@ -272,29 +272,4 @@ evt_configure_eventdev_with_adapter(struct evt_options *opt, uint8_t nb_queues,
 	return rte_event_dev_configure(opt->dev_id, &config);
 }
 
-static inline void delay_nanoseconds(uint64_t nanoseconds) {
-    uint64_t start_time, end_time;
-    uint64_t elapsed_nanoseconds;
-    uint64_t cycles = nanoseconds;
-    // printf("hz: %lu, nanoseconds: %lu\n", tsc_hz, nanoseconds);
-
-    start_time = rte_get_timer_cycles();
-    do {
-        end_time = rte_get_timer_cycles();
-        elapsed_nanoseconds = end_time - start_time;
-    } while (elapsed_nanoseconds < cycles);
-}
-
-static inline void delay_cycles(uint64_t cycles) {
-    uint64_t start_time, end_time;
-    uint64_t elapsed_nanoseconds;
-
-    start_time = rte_get_timer_cycles();
-    do {
-        end_time = rte_get_timer_cycles();
-        elapsed_nanoseconds = end_time - start_time;
-    } while (elapsed_nanoseconds < cycles);
-}
-
-
 #endif /*  _EVT_COMMON_*/

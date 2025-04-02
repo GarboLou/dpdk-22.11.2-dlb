@@ -134,7 +134,7 @@ perf_queue_worker_burst(void *arg, const int enable_fwd_latency)
     /* Time */
     // MODIFY HERE: TEST LATENCY PERIOD
     uint16_t interval = 1;  // unit of s
-    uint64_t interval_cycles = (uint64_t) (interval * hz / 1000.0);
+    uint64_t interval_cycles = (uint64_t) (interval * hz / 10000.0);
     uint64_t tx_prev_tsc, tx_cur_tsc, tx_diff_tsc;
     tx_prev_tsc = rte_get_timer_cycles();
     uint16_t nb_tx = 0;
@@ -148,14 +148,14 @@ perf_queue_worker_burst(void *arg, const int enable_fwd_latency)
     tsc_hz = rte_get_timer_hz();
     // printf("tsc_hz: %lu\n", tsc_hz);
 	while (t->done == false) {
-        if (rte_event_port_links_get(dev, port, queues, priorities) == 0) {
-            break;
-        }
+        // if (rte_event_port_links_get(dev, port, queues, priorities) == 0) {
+        //     break;
+        // }
 
 		nb_rx = rte_event_dequeue_burst(dev, port, ev, BURST_SIZE, 0);
 
 		if (!nb_rx) {
-			rte_pause();
+			// rte_pause();
 			continue;
 		}
 
@@ -185,12 +185,12 @@ perf_queue_worker_burst(void *arg, const int enable_fwd_latency)
                 // rte_delay_us_sleep(1);
                 // printf("dummy process delay is %lu\n", dummy_process_delay);
                 if (dummy_process_delay > 0) {
-                    delay_cycles(dummy_process_delay);
+                    delay_cycles(dummy_process_delay, t);
 				}
             } else {
                 dummy_process_delay = opt->dummy_delay;
                 if (dummy_process_delay > 0) {
-                    delay_cycles(dummy_process_delay);
+                    delay_cycles(dummy_process_delay, t);
 				}
             }
             // ===========
@@ -310,6 +310,7 @@ perf_queue_worker_burst(void *arg, const int enable_fwd_latency)
 	// 	printf("\033[1;36mwlcore %d processed %ld packets (%lf %%) from queue %d\033[0m\n", rte_lcore_id(), wlcore_queue_pkts[rte_lcore_id()][i], wlcore_queue_pkts[rte_lcore_id()][i]*1.0/count*100.0, i);
 	// }
 	// =========== PRINT WORKER STATS
+	// printf("wlcore %d processed %ld packets from queue %d\n", rte_lcore_id(), wlcore_queue_pkts[rte_lcore_id()][0], 0);	
 
 	perf_worker_cleanup(pool, dev, port, ev, enq, nb_rx);
 

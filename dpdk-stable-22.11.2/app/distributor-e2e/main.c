@@ -118,7 +118,7 @@ static inline void delay_nanoseconds(uint64_t nanoseconds) {
   do {
     end_time = rte_get_timer_cycles();
     elapsed_nanoseconds = end_time - start_time;
-  } while (elapsed_nanoseconds < cycles);
+  } while (elapsed_nanoseconds < cycles && !quit_signal_work);
 }
 
 static inline void delay_cycles(uint64_t cycles) {
@@ -130,7 +130,7 @@ static inline void delay_cycles(uint64_t cycles) {
   do {
     end_time = rte_get_timer_cycles();
     elapsed_cycles = end_time - start_time;
-  } while (elapsed_cycles < cycles);
+  } while (elapsed_cycles < cycles && !quit_signal_work);
 }
 
 /*
